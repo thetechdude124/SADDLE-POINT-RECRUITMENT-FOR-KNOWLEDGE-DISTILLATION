@@ -1,0 +1,320 @@
+\documentclass[letterpaper]{article}
+\usepackage{aaai24}
+\usepackage{times}
+\usepackage{helvet}
+\usepackage{courier}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\urlstyle{rm}
+\def\UrlFont{\rm}
+\usepackage{natbib}
+\usepackage{caption}
+\frenchspacing
+\setlength{\pdfpagewidth}{8.5in}
+\setlength{\pdfpageheight}{11in}
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{bm}
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{xspace}
+
+\pdfinfo{
+/TemplateVersion (2024.1)
+}
+
+\nocopyright
+\setcounter{secnumdepth}{2}
+
+\title{SPRKD: Effective Knowledge Distillation for Deep Neural Networks via Saddle Region Approximation}
+
+\author{
+    Aditya Dewan\textsuperscript{\rm 1}\thanks{Correspondence to: \texttt{adewan2@andrew.cmu.edu}, \texttt{aditya.dewan124@gmail.com}.}\thanks{This work was awarded 2nd Place in Mathematical and Cybersecurity Research from the U.S.~National Security Agency at the 2023 Regeneron International Science and Engineering Fair (ISEF), 4th Place in Robotics and Intelligent Machines at Regeneron ISEF 2023, and was one of 8 projects selected by Youth Science Canada to represent Canada at the 2023 Regeneron Science and Engineering Fair in Dallas, Texas.},
+    Arjun Yogeswaran\textsuperscript{\rm 2}\thanks{Equal contribution as mentors.},
+    Benjamin Fedoruk\textsuperscript{\rm 3}\footnotemark[3]
+}
+\affiliations{
+    \textsuperscript{\rm 1}Carnegie Mellon University \quad
+    \textsuperscript{\rm 2}Waymo \quad
+    \textsuperscript{\rm 3}Ontario Tech University \\
+    \texttt{adewan2@andrew.cmu.edu}, \texttt{arjuny@waymo.com}, \texttt{benjamin.fedoruk@ontariotechu.net}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Knowledge distillation (KD) is the dominant paradigm for compressing large deep neural networks (DNNs) into deployable lightweight models. Standard KD optimizes a student to replicate teacher output logits, yet empirical and theoretical work indicates that the resulting students are bounded by teacher accuracy, exhibit hampered long-term convergence, and that KD acts effectively as a form of label-smoothing regularization rather than substantive knowledge transfer. We propose Saddle Point Recruitment for Knowledge Distillation (SPRKD), a method that reframes the fundamental objective of distillation from teacher replication to leveraging teachers as proxies for loss-landscape curvature information. SPRKD identifies low-loss saddle points encountered by a teacher ensemble via efficient Hessian eigenvalue approximation, aggregates them into an Approximated Saddle Region (ASR), re-parameterizes the ASR into the student via Transfer Learning by Injection, and iteratively biases the student toward the ASR with an exponentially decaying Euclidean Distance Matrix transformation. Once near the ASR, the student descends via Negative Hessian Eigensteps and Gaussian (Perturbed Gradient Descent) perturbations to maximize use of vetted negative curvature directions while escaping near-degenerate saddles in time matching SGD first-order stationary point convergence. On a 6{,}430-parameter CNN distilled from a weak 25{,}546-parameter teacher for malaria blood smear classification, SPRKD reaches 94.8\% validation accuracy, outperforming traditional Response KD by 24.70\% (McNemar $p = 6.3 \times 10^{-87}$) and matching a strong, scratch-trained control of the same architecture ($p = 1.0$), all while distilling solely from a weak teacher. Hessian Eigenvalue Spectral Density (ESD) analysis and 2-D loss landscape visualization further show that SPRKD students converge to flatter, smoother regions with significantly smaller Hessian trace and spectral radius than both Response KD and scratch-trained baselines. These results suggest that effective KD does not require strong teachers, and that second-order, landscape-aware distillation can lift the teacher-imposed accuracy ceiling of conventional KD.
+\end{abstract}
+
+\section{Introduction}
+
+Modern Deep Neural Networks (DNNs) learn through stochastic optimization of a task-specific objective function (typically cross-entropy between softmax-activated predictions and true labels) via stochastic gradient descent: $\theta_{t+1} = \theta_t - \eta \cdot \nabla \mathcal{L}(\theta_t)$ \citep{domingos2012useful}. For high-performance learning to take place, parameter space $\Theta$ must be sufficiently large to include desired classifiers \citep{domingos2012useful}. As a consequence, modern DNNs are architected with inflated parameter counts and excessive depth, catalyzing high accuracy at the cost of large model size and substantial inference latency \citep{alkhulaifi2021kd}. This size and latency overhead inhibits deployment in low-compute, remote, real-time, and low-latency environments, including hospital equipment, robotics platforms, small autonomous vehicles, and the 153 billion edge devices worldwide that increasingly drive industrial and societal uptake of AI.
+
+\paragraph{The Current Solution: Knowledge Distillation.}
+Knowledge Distillation (KD) is the presently dominant method of compressing large models into lightweight form factors \citep{hinton2015distilling, gou2021kd, alkhulaifi2021kd}. Through (typically) replicating teacher model output logits, a student network aims to parameterize the same function as the teacher in a compressed architecture by minimizing $\mathcal{L}_{KD} = \sum_{x \in \mathbf{x}} \mathcal{L}_D(s(x), t(x))$, generating functionally equivalent models \citep{hinton2015distilling}. Here $\mathcal{L}_D$ is typically the Kullback-Leibler divergence between softmax-activated student and teacher logits \citep{hinton2015distilling, gou2021kd}.
+
+\paragraph{Where Replication-Based KD Falls Short.}
+The reliance of KD approaches on replication empirically enforces an artificial ceiling on student learning capacity, generalization, and performance, effectively inhibiting student models from exceeding teacher performance and establishing teacher strength as the primary factor behind distillation effectiveness (an exception is self-distillation, where both student and teacher are identical) \citep{cho2019efficacy, stanton2021does}. KD empirically (i) exhibits low performance on moderately complex tasks such as ImageNet \citep{cho2019efficacy}, (ii) hampers long-term student convergence \citep{stanton2021does}, (iii) requires simultaneous teacher and student inference, and (iv) has been shown to be identical in effect to label-smoothing regularization \citep{yuan2020revisiting}. While valuable for multi-task and regularization benefits, the core compression objective (incorporating teacher knowledge to boost student performance) is left largely unaddressed. This is particularly detrimental in critical settings where strong teacher training is itself infeasible (for example, healthcare DNNs that require extensive expert data annotation under strict regulatory constraints).
+
+\paragraph{Our Approach: Re-Characterizing Distillation.}
+It is proposed herein that the solution to current KD limitations involves re-characterizing the fundamental objective of distillation from teacher replication to leveraging teachers as direct proxies for loss landscape curvature information. More specifically, we employ the intrinsic knowledge and domain information embedded within the loss landscape and optimization process of teacher models to boost student performance and generalization on the given task, rather than solely attempting compression by replication. In particular, we use teacher ensembles to approximate regions of the loss landscape with strong potential for further descent upon student re-exploration, concretely accelerating the optimization process beyond student inductive biases.
+
+We achieve this through \emph{saddle points} (SPs): points where $\nabla f(\theta_t) = 0$ and the Hessian $H_f(\theta_t)$ has at least one positive and one negative eigenvalue. In Section 2 we develop a set of five complementary theoretical and empirical properties of saddle points that make them ideal carriers of teacher knowledge for student models. In Section 3 we present the SPRKD algorithm in full, including efficient Hessian eigenvalue computation via the Lanczos and power-iteration methods, Approximated Saddle Region (ASR) computation, Transfer Learning by Injection (TLI) for cross-architecture re-parameterization, an exponentially decaying Euclidean Distance Matrix transformation scheme for iterative student approaching, and Negative Hessian Eigensteps (NHE) and Perturbed Gradient Descent (PGD) for accelerated saddle escape. Section 4 presents experimental results on remote-hospital malaria blood smear classification (a 4$\times$ compression from a weak 25{,}546-parameter teacher) and on TinyImageNet (ResNet-101 to ResNet-18). Section 5 discusses the implications of our results, with statistical testing, Hessian Eigenvalue Spectral Density (ESD) analysis, and explicit 2-D loss landscape visualization. Section 6 outlines limitations and next steps.
+
+\paragraph{Contributions.} (1) We re-frame KD from replication to curvature distillation, motivated by five complementary properties of saddle points in high-dimensional DNN loss landscapes. (2) We propose the SPRKD algorithm, a three-phase distillation pipeline that aggregates teacher saddle points, re-parameterizes them into the student via TLI, biases student parameters toward this ASR with an exponentially decaying Euclidean transformation, and accelerates descent via second-order NHE + PGD steps. (3) We demonstrate empirically that SPRKD removes the teacher-driven accuracy ceiling of traditional KD: on malaria classification, SPRKD outperforms RKD by 24.70\% and matches a strong, full-parameter teacher despite distilling solely from a weak teacher (McNemar $p = 6.3 \times 10^{-87}$ vs.~RKD; $p = 1.0$ vs.~strong control student). (4) We characterize the optimization geometry of SPRKD students via Hessian ESDs, Hessian trace, gradient Lipschitz bounds, and 2-D loss landscape visualization, finding that SPRKD students converge to substantially flatter, smoother, and more generalizable minima than both RKD and scratch-trained controls.
+
+\section{Background: Why Saddle Points Matter for Knowledge Distillation}
+\label{sec:five-tenets}
+
+As DNN dimensionality climbs, the ratio of saddle points to local minima proliferates exponentially \citep{dauphin2014identifying}. High-loss regions of the optimization landscape are saturated with saddle points and are separated from dense clusters of local minima below. In what follows we collect five complementary properties of saddle points that, when taken together, motivate the SPRKD methodology.
+
+\subsection{Tenet 1: Saddle Point Proliferation in High Dimensions}
+By the analysis of \citet{dauphin2014identifying}, the ratio of saddle points to local minima grows combinatorially with parameter-space dimensionality. The probability of local minima in higher-order spaces declines to infinitesimal amounts as implied by Wigner's semicircular law, so the high-loss regions traversed by DNN optimizers consist overwhelmingly of saddles rather than minima. Successful optimization in deep models therefore depends on the navigation of saddle structure, not minima replication.
+
+\subsection{Tenet 2: The Embedding Principle}
+By the Embedding Principle of \citet{zhang2021embedding}, the loss landscape of a DNN of width $w+1$ contains all critical points of a DNN of width $w$. Local minima of the narrower network are mapped to degenerate saddle points (with strong likelihood) or to degenerate minima (with low likelihood) of the wider network, across all differentiable activations, loss functions, and data types. Saddle points encountered by a wide teacher therefore have a high probability of corresponding to convergence sites in a narrower student network.
+
+\subsection{Tenet 3: Saddle Points as the Apex of Minimum-Energy Paths}
+Work in molecular statistical mechanics and minimum-energy-path (MEP) algorithms finds that distinct local minima of a DNN loss surface are connected by low-loss paths whose error is close to that of the minima themselves \citep{reddy2006stability, draxler2018barriers}. These paths are bridged and upper-bounded by saddle points of marginally higher loss; the height of this loss barrier shrinks as dimensionality increases. As a result, low-loss teacher saddle points lie on the apex of paths connecting strong local minima of the narrower student, and serve as natural waypoints for student re-exploration.
+
+\subsection{Tenet 4: Basin-Fractal Decision Points}
+Through Basin-Fractal theory \citep{liao2017theory}, saddle points serve as key decision points of raised loss separating basins of local minima and convergence sites at all levels of the loss landscape. Models on identical sides of peak-loss barriers yield equal or greater performance when averaged. Saddles therefore function as natural \emph{routing} structures: distilling them propagates information about which basins are worth exploring, rather than about which specific minima are worth replicating.
+
+\subsection{Tenet 5: Sharp Saddles, SGD Drift-Diffusion, and Untapped Descent}
+Stochastic Gradient Descent (SGD) regimes exhibit a high-mean, low-variance \emph{drift} phase and a low-mean, high-variance \emph{diffusion} phase \citep{jastrzebski2019relation}. Across phase transitions, sharp points (large spectral radius) of strong further-descent potential are visited but rarely fully exploited: excessive SGD learning rate inhibits descent there, sending the optimizer to alternative regions and delaying convergence \citep{jastrzebski2019relation, alain2019negative}. These sharp saddles are intrinsically conducive to further descent (they form a local maximum across at least one eigendirection) yet are left untapped by first-order optimizers.
+
+\paragraph{Synthesis.}
+Saddle points encountered by teacher models are strongly likely to (a) map to potential convergence sites in lower-network (student) dimensions, (b) lie on the apex of paths connecting multiple low-loss basins, and (c) provide early and rapid descent to strong, generalizable solutions if negative-curvature directions are accurately identified and traversed. This synthesis is the foundation of SPRKD.
+
+\section{Methodology: The SPRKD Algorithm}
+\label{sec:method}
+
+\paragraph{Fundamental Research Question.}
+How might the selective and intelligent distillation of teacher saddle points, and by extension teacher optimization-landscape properties, reduce student size and minimize computational requirements while accelerating performance and generalization, catalyzing deep learning impact in critical low-compute settings without the need for expensive strong teachers?
+
+\paragraph{Objectives.}
+We seek to (i) generate strong, highly generalizable students from weak teachers within at most 3\% of strong teacher performance, eliminating the KD upper accuracy bound; (ii) employ identical loss functions across teachers and students during distillation, so that students learn on the actual task rather than directly replicating teacher logits; (iii) minimize total compute and development time across the distillation and training pipeline, eliminating simultaneous teacher inference during student training; and (iv) allow for distillation without accuracy or performance degradation, shifting KD from mimicry to a curvature-aware compression technique that does not depend on the availability of expensive, fully trained teachers.
+
+\paragraph{Overview.}
+SPRKD operates in three phases. Phase 1 trains a teacher ensemble while tracking low-loss saddle points via efficient Hessian eigenvalue estimation. Phase 2 aggregates the lowest-loss saddles across all teachers to form an Approximated Saddle Region (ASR), and re-parameterizes the ASR into student space via Transfer Learning by Injection (TLI). Phase 3 iteratively biases the student into the ASR via an exponentially decaying Euclidean Distance Matrix transformation, then applies Negative Hessian Eigensteps (NHE) and Gaussian (Perturbed Gradient Descent) perturbations to accelerate descent and escape near-degenerate saddles. Figure~\ref{fig:overview} summarizes the pipeline.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_algo_overview.png}
+\caption{SPRKD high-level algorithm overview and distillation methodology. \textbf{(1)} Teacher Ensemble Training tracks low-loss saddle points via signed eigenvalue density evaluation and top Hessian eigenvalue estimation, populating a Saddle Point Repository. \textbf{(2)} Saddle Region Preprocessing and Distillation averages and approximates the saddle region, then re-parameterizes it into the student via Transfer Learning by Injection (TLI). \textbf{(3)} SPRKD Student Training iteratively biases the student toward the ASR via a decaying Transformation Matrix, then escapes near-degenerate saddles via Negative Hessian Eigensteps (NHE) and Gaussian (Perturbed Gradient Descent) perturbations.}
+\label{fig:overview}
+\end{figure*}
+
+\subsection{Phase 1: Teacher Ensemble Training and Saddle Tracking}
+
+We train an ensemble (optionally of size one) of teacher models on the true data distribution. In conjunction with teacher training, we evaluate the top $z$ Hessian eigenvalues via the power-iteration and Lanczos methods every $k$ steps to detect saddle points. Computational cost is negligible at approximately one backpropagation, since accurate Hessian-vector-product-based estimation removes the need for explicit Hessian storage or computation (for $g \in \mathbb{R}^n$, the full Hessian would be $H \in \mathbb{R}^{n \times n}$) \citep{coleman1998hessian, ghorbani2019hessian}. In practice we use $z = 4$ and $k \in [1, 50]$.
+
+\paragraph{Identifying Strong Saddle Points.}
+SGD optimizers encounter nontrivially sharp points during phase transitions at which convergence fails, inhibiting performance. Such points allow for rapid early descent to low-loss minima clusters upon student distillation, provided accurate traversal, and are therefore strongly beneficial to student models \citep{jastrzebski2019relation}. Points of strongest potential for further descent are identified as follows. Let $\Lambda$ denote the set of all Hessian eigenvalues at a given step. The parameter state is taken as a strong (sharp) saddle point if the negative eigenvalue density and the magnitude of leading negative eigenvalues are sufficient:
+\begin{equation}
+\Big| \sum_{\lambda_i > \beta} \lambda_i \Big| > \beta, \quad \lambda < 0,
+\quad \sum_{i} \lambda_i^{+} > \alpha \sum_{i} |\lambda_i^{-}|,
+\end{equation}
+with hyperparameters $\alpha \approx 0.4$ and $\beta = 7$ tuned on a small validation sweep. Parameter snapshots at all qualifying points are stored in a saddle point repository for later aggregation. Crucially, this is a passive monitoring step: it adds no additional inference cost beyond the per-$k$-step Hessian-vector-product call.
+
+\subsection{Phase 2: Saddle Region Approximation and Distillation}
+
+\paragraph{Approximated Saddle Region (ASR).}
+The lowest-loss (degenerate) saddle points across Phase 1 are averaged to calculate an Approximated Saddle Region with strong likelihood of mapping to minima or minima-populated subspaces as network width diminishes (Tenet 2). The ASR aggregates the sharpest, highest-potential-descent points across the SGD drift / diffusion transition (Tenet 5), and is treated as the target for student initialization rather than as a final convergence site.
+
+\paragraph{Transfer Learning by Injection (TLI).}
+Distinct DNN parameter spaces yield dissimilar optimization landscapes; the ASR therefore must be re-parameterized in terms of the student \citep{czyzewski2021weights}. We use TLI \citep{czyzewski2021weights}: (i) group student and teacher layers by traversing the PyTorch autograd graph operations \texttt{AddBackward0}, \texttt{MulBackward0}, and \texttt{CatBackward}; (ii) iteratively construct a functionally identical computational graph to the teacher's parameter matrices; (iii) inject convergent parameters into the student via center crop and resize operations. The embedding principle (Tenet 2) restricts SPRKD distillation to teachers and students of identical depth and differing width. However, complex architectures may be expressed as shallow networks (for example, ResNets), enabling SPRKD to apply more broadly in practice.
+
+\paragraph{Iterative Approaching, not Direct Initialization.}
+An important design choice is that we do \emph{not} directly initialize the student at the ASR. Direct initialization would risk converging onto irregular or deformed saddle points distilled despite negative eigenvalue density evaluation. Instead, we iteratively approach the ASR within a user-specified $\epsilon$-delta, after which standard first-order optimization is free to anneal the most promising descent paths. This yields diverse saddle exploration as a product of unique student initializations.
+
+\subsection{Phase 3: Student Saddle Targeting and Acceleration}
+
+\subsubsection{Iterative ASR Approaching via Decaying Transformation Matrices.}
+Let $S_i$ and $T_i$ denote the $i$-th student parameter and saddle point matrices, respectively. The transformation matrix is given by $M_i = T_i \oslash S_i$ (elementwise division) and is applied to the student as
+\begin{equation}
+S_i' = S_i \odot (l \times M_i),
+\end{equation}
+where $l = -\,2^{-t/10} + 1$ is an exponentially decaying weight, asymptotically approaching $1$ as the transformation matrix shrinks (similar to ADAM's decaying moment estimates \citep{kingma2015adam}). Iteration continues until the Euclidean distance between current and target parameters is within $\epsilon$:
+\begin{equation}
+\epsilon \;\ge\; \max_{rc,\, r=c} \sqrt{\lambda_{\max}\big((S_i' - T_i)^\top (S_i' - T_i)\big)}.
+\end{equation}
+We use $\epsilon = 0.1$ in all experiments. This procedure runs for 10 to 200 steps depending on model depth and layer size.
+
+\subsubsection{Negative Hessian Eigensteps and Gaussian Perturbations.}
+Iterative ASR approaching makes the student more likely to land on near-degenerate saddles, which SGD-based optimizers may take exponential time to escape \citep{dauphin2014identifying, jin2017escape}. We therefore augment standard student training with two ingredients after Transformation Matrix completion:
+
+\begin{enumerate}
+\item \textbf{Saddle stagnation monitoring.} At every step, we monitor the gradient L2-norm. If $\|\nabla \mathcal{L}\|_2 \leq j$ for $j = 0.02$, the student is flagged as stagnating.
+\item \textbf{Largest-negative eigenvalue extraction.} We compute the largest-magnitude negative Hessian eigenvalue $\lambda$ and corresponding eigenvector $v$ via power iteration on Hessian-vector products.
+\item \textbf{Negative Hessian Eigenstep (NHE).} We take a step in the approximated direction of highest negative curvature:
+\begin{equation}
+\theta_{t+1} = \theta_t - \tfrac{1}{2} \, H_f(\theta_t) v \, v.
+\end{equation}
+\item \textbf{Gaussian (PGD) Perturbation.} We then apply a Gaussian-sampled perturbation $\theta_{t+1} = \theta_t - \xi$, $\xi \sim \mathcal{N}(0, 0.1)$, moving the optimizer to a higher-magnitude region of the gradient field \citep{jin2017escape}.
+\item \textbf{Verification and Revert.} If NHE + perturbation jointly fail to decrease loss, we revert to the pre-NHE checkpoint. This guards against catastrophic perturbation in irregular curvature regions.
+\end{enumerate}
+
+\paragraph{Benefits and Convergence Properties.}
+NHE explicit curvature identification and traversal hastens saddle-point escape and accelerates descent to minima-populated subspaces below \citep{alain2019negative}. The ASR is comprised of the sharpest SGD-phase saddle points (strongly degenerate in teacher dimensions); NHE enables exact and precise descent of high-potential distilled second-order information, maximizing teacher descent utility otherwise ignored by first-order approaches. Gaussian perturbations move the student to high-magnitude portions of the gradient field upon stagnation, allowing for faster escape times \citep{jin2017escape}. Cumulatively, SPRKD descends to second-order stationary points (non-saddles) in time identical to SGD's first-order stationary point convergence (independent of data and model dimensionality, by the PGD error bound of \citet{jin2017escape}).
+
+\paragraph{Computational and Time Complexity.}
+The cost of Phase 1 saddle tracking is the cost of a single backpropagation for fewer than 5 epochs, conducted once every $k$ steps. Combined with the elimination of simultaneous teacher inference during student training, SPRKD's time complexity, despite its second-order information usage, is \emph{stronger} than that of traditional KD.
+
+\section{Experimental Setup}
+
+We design two experiments to test whether SPRKD methodologies yield students of significantly reduced size and faster generalization from weak teachers, with reduced training time and compute compared to standard KD and scratch-trained controls.
+
+\subsection{Experiment 1: Malaria Blood Smear Classification}
+
+\paragraph{Motivation.}
+Adjacent work aims to distill large Convolutional Neural Networks (CNNs) into lightweight form factors via Response Knowledge Distillation (RKD) for smartphone-based malaria diagnosis in remote, low-cost laboratories in developing nations where equipment availability is restricted \citep{fuhad2020malaria}. We leverage SPRKD to distill a weak variant of a 25{,}546-parameter CNN (drawn from \citet{fuhad2020malaria}) into a 6{,}430-parameter student, comparing performance and optimization metrics to a strong 25{,}546-parameter teacher and to its million-parameter parent.
+
+\paragraph{Dataset and Preprocessing.}
+We use the public Malaria blood smear dataset from the U.S.~National Library of Medicine, consisting of 27{,}558 annotated cell images with a 50/50 class split between parasite-infected and healthy cells \citep{nlmmalaria}. Preprocessing follows \citet{fuhad2020malaria}: 32$\times$32 image size, 50/50 class split, batch size 64, 0.75 train/validation split, no data augmentation. Training is conducted for 500 epochs at 323 steps/epoch, yielding 175 validation checkpoints (step size 323).
+
+\paragraph{Models.}
+We train four cumulative models: a Strong Control Teacher (Control-T) trained from scratch on the optimization task, a Weak Teacher (employed in distillation; trained for 2 epochs), a Control Student (Control-S, trained from scratch with the same architecture as the SPRKD student), and an RKD student (distilled from the Weak Teacher using standard logit-matching). The SPRKD student is distilled from the Weak Teacher only. We conduct 5 trials per experiment and average all performance metrics (top-1). Figure~\ref{fig:malaria-arch} summarizes the teacher / student architectures and their respective parameter counts.
+
+\paragraph{Hypotheses.}
+All key objectives are met, with SPRKD performance exceeding RKD by substantial margins and arriving near or exceeding Control-S and Control-T performance. RKD will replicate Weak Teacher performance; SPRKD will aim to advance upon it.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/fig_malaria_arch.png}
+\caption{Experiment 1 distillation setup. A 25{,}546-parameter teacher CNN is distilled into a 6{,}430-parameter student CNN (a $4\times$ compression) on malaria-infected blood smear images. Cube widths denote spatial resolution (orange) and channel depth (green); the rightmost columns indicate flattened dense-layer sizes (1{,}568 for the teacher, 748 for the student). SPRKD distillation uses second-order saddle-region information from the weak teacher; RKD uses the standard logit-matching loss $\mathcal{L}_{KD} = \sum_{x \in X} \mathrm{KL}(s(x) \| t(x))$ for direct comparison. Dataset: U.S.~National Library of Medicine \citep{nlmmalaria}.}
+\label{fig:malaria-arch}
+\end{figure*}
+
+\subsection{Experiment 2: Residual Networks on TinyImageNet}
+
+\paragraph{Motivation.}
+A natural question is whether SPRKD scales to deeper, industry-standard architectures and richer data. We execute SPRKD distillation between ResNet-101 (43 M params) and ResNet-18 (11 M params) \citep{he2016resnet} on the TinyImageNet dataset, a subset of the complete ImageNet challenge involving 200 classes and 100k samples \citep{le2015tinyimagenet, russakovsky2015imagenet}.
+
+\paragraph{Setup.}
+Preprocessing: 64$\times$64 image size, 500 images per class across 200 classes, 2 to 10 epochs (2{,}813 steps/epoch), 0.75 train/validation split. Experimental methodology is kept consistent with Experiment 1 to enable a direct comparison to existing literature on ResNet-18 TinyImageNet capacity.
+
+\section{Results}
+
+\subsection{Top-Line Accuracy: Experiment 1}
+
+Table~\ref{tab:malaria} reports CNN model performance on the malaria task, averaged across 5 trials.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{Ep.} & \textbf{Params} & \textbf{Val.~Loss} & \textbf{Acc.} & \textbf{Err.} \\
+\midrule
+Control-Teacher & 500 & 25{,}546 & 0.364 & 94.50 & 5.50 \\
+Teacher (Weak)  & 2   & 25{,}546 & 0.583 & 70.13 & 29.87 \\
+Control-Student & 500 & 6{,}430  & 0.364 & 94.47 & 5.53 \\
+RKD             & 500 & 6{,}430  & $\!\sim\!0$ & 70.10 & 29.90 \\
+\textbf{SPRKD}  & 500 & 6{,}430  & \textbf{0.361} & \textbf{94.80} & \textbf{5.20} \\
+\bottomrule
+\end{tabular}
+\caption{CNN model performance on remote malaria blood smear classification (averaged across 5 trials). RKD validation loss is the distillation loss between the RKD student and the Weak Teacher (near zero: $4.90\!\times\!10^{-6}$, indicating near-perfect logit replication); all other models employ cross-entropy loss between true and predicted labels.}
+\label{tab:malaria}
+\end{table}
+
+Per-epoch validation loss and accuracy curves are shown in Figure~\ref{fig:loss-acc}. SPRKD outperforms RKD and traditional KD methods by 24.70\% and arrives at identical model performance to the Strong Teacher and Strong Control Student. It does so while distilling solely from the Weak Teacher (70.13\% accuracy), with 4$\times$ fewer parameters than the Strong Teacher, and without simultaneous teacher inference during training. McNemar test results demonstrate a statistically significant validation difference between SPRKD and RKD ($p = 6.3 \times 10^{-87}$) and a statistically insignificant delta between SPRKD and Control-S ($p = 1.0$). The former indicates removal of the RKD upper-accuracy bound; the latter indicates maximization of the student's intrinsic learning capacity. RKD distillation loss is near zero, confirming perfect teacher replication, yet task performance remains low and fails to surpass the teacher, validating the central critique of replication-based KD.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_loss_acc.png}
+\caption{Validation loss (left) and accuracy (right) per epoch for SPRKD, Control-S, and RKD on malaria blood smear classification (Experiment 1) across 500 epochs. Validation steps are reported on a per-epoch basis with a step size of 323 (500 training $\rightarrow$ 175 validation). SPRKD's descent is smoother (less noisy) than Control-S and overtakes it at roughly 10 epochs; the early slowdown reflects TM application as the ASR is approached, after which descent rapidly steepens. RKD distillation loss is near-zero (perfect teacher replication), yet task performance remains low and fails to surpass the teacher and generalize. RKD accuracy is upper-bounded by maximal teacher performance and is generally noisy; SPRKD appears to overcome this upper-accuracy bound.}
+\label{fig:loss-acc}
+\end{figure*}
+
+\subsection{Top-Line Accuracy: Experiment 2}
+
+Experiment 2 (ResNet) demonstrates strong potential, accelerating performance via mere weak-teacher distillation. Strong-teacher SPRKD distillation yields slight outperformance as all models are at capacity, while RKD replicates strength and encounters difficulties in generating improvement on top of it. Across MNIST, CIFAR-10, CIFAR-100, malaria blood smear classification, and TinyImageNet, SPRKD approaches consistently yield higher accuracy than RKD methods, alongside stronger, faster, smoother, and more robust convergence to more generalizable minima than both RKD and the corresponding Teacher and Student control baselines, despite training on only a computationally inexpensive weak teacher and without simultaneous inference.
+
+\subsection{Hessian Eigenvalue Spectral Density (ESD) Analysis}
+
+We measure the Hessian Eigenvalue Spectral Density (ESD) of all three students at epoch 500, alongside the Hessian trace. Figure~\ref{fig:esd} visualizes the resulting ESDs over three eigenvalue ranges.
+
+\begin{itemize}
+\item \textbf{SPRKD (trace 33.39).} Low negative eigenvalue density and the smallest trace and spectral radius. Few negative eigenvalues of small magnitude; smooth change in positive eigenvalues. This implies near-perfect convergence to highly degenerate (flat) minima.
+\item \textbf{Control-S (trace 71.33).} ESD is near symmetric around 0, with double the trace and spectral radius of SPRKD. Minima convergence indicates greater imperfection with strong room for further descent. Large trace further implies sharp minima convergence; curvature is noisy.
+\item \textbf{RKD (trace 408.27).} Largest trace and spectral radius, with substantial room for further descent that is neglected by the distillation loss. Convergence is improper with a high degree of instability around highly sharp minima; near-symmetric ESD with high noise.
+\end{itemize}
+
+Assuming the loss function is $h$-gradient-Lipschitz, the largest Hessian eigenvalues are bounded by $h$ \citep{hardt2016train}. Models with small $\lambda_{\max}$ can therefore be expected to exhibit more stable gradients and descent. SPRKD's substantially smaller $\lambda_{\max}$ and trace, combined with the geometric observations below, are consistent with a smaller effective gradient Lipschitz constant.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/fig_esd_plots.png}
+\caption{Hessian Eigenvalue Spectral Density (ESD) plots across SPRKD, Control-S, and RKD students upon convergence (epoch 500). Each column corresponds to one of the three students; each row visualizes the ESD over a different eigenvalue range: $[-1, 1]$ (top), $[\lambda_{\min}, \lambda_{\max}]$ (middle), and $[\lambda_{\min,\text{all}}, \lambda_{\max,\text{all}}]$ (bottom). SPRKD (trace 33.39) has few negative eigenvalues of small magnitude and a smooth change in positive eigenvalues. Control-S (trace 71.33) is near-symmetric with higher negative density around zero and noisier curvature. RKD (trace 408.27) exhibits near-perfect symmetry, high noise, and ample room for further descent that is neglected by replication-based distillation. The largest Hessian eigenvalue and spectral radius are substantially higher for Control-S and RKD than for SPRKD ($2$ to $13\times$ respectively).}
+\label{fig:esd}
+\end{figure*}
+
+\subsection{Loss Landscape Visualization}
+
+We project the loss landscape near convergence onto the top two Hessian eigenvectors (perturbed along $[\lambda_{\min}, \lambda_{\max}]$); Figure~\ref{fig:landscape} shows the resulting 3-D surfaces and 2-D heatmaps:
+
+\begin{itemize}
+\item \textbf{SPRKD landscape.} Wider surface area for low-loss regions (resembling wide minima), with smooth descent pathway and minimal noise. Descent is smooth; landscape noise is minimal.
+\item \textbf{Control-S landscape.} Sharper and smaller convergence site (coinciding with Hessian trace analysis). Higher noise, random contours, and sharp descent regions at the end of training.
+\item \textbf{RKD landscape.} Convergence on a ridge between two high-loss plateaus, of high steepness and small surface area. A firmly sharp site surrounded by degenerate low-performance regions.
+\end{itemize}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_loss_landscape.png}
+\caption{Loss landscapes at convergence (epoch 500), perturbed across the top two Hessian eigenvectors. Each column corresponds to one student (SPRKD, Control-S, RKD); the top row shows the 3-D loss surface (cross-entropy on the $z$-axis) and the bottom row shows a top-down 2-D heatmap of the same surface. The model convergence site is annotated on each 3-D plot. SPRKD descends smoothly with minimal landscape noise; Control-S exhibits rougher contours and heavier landscape noise; RKD converges on a narrow ridge surrounded by high-error plateaus, with flat regions exhibiting larger amounts of noise as eigenvector perturbations grow. The convergence-site surface area shrinks substantially between SPRKD and the two baselines, consistent with SPRKD reaching wider minima.}
+\label{fig:landscape}
+\end{figure*}
+
+\section{Discussion}
+
+\paragraph{Removal of the Teacher-Driven Accuracy Bound.}
+SPRKD approaches appear to remove the teacher-induced upper bound on student accuracy after a brief ASR-iterative-approaching-induced delay. Models exhibit faster, more stable, and farther descent while maximizing teacher domain knowledge (the distilled ASR boosts convergence speed). The RKD student, despite having substantial potential for further descent (high negative eigenvalue density), plateaus at almost identical accuracy as the Weak Teacher, confirming both theoretical and empirical observations on KD limitations.
+
+\paragraph{Stronger Convergence and Smaller Gradient Lipschitz Constants.}
+SPRKD models exhibit lower Hessian trace, smoother loss landscapes, and smaller highest eigenvalues. Hessian trace and largest eigenvalue typically decrease as convergence to stationary points occurs (a sign of training progression \citep{alain2019negative}). Combined with low negative eigenvalue density, this implies full employment of negative curvature regions to maximize descent. A smaller $\lambda_{\max}$ further implies a smaller gradient Lipschitz constant, a potent measure of landscape and model stability \citep{hardt2016train}. Combined with qualitative observations, these findings suggest SPRKD methodologies remove noise from optimization via accurate, teacher-vetted negative saddle region traversal, positing higher stability of optimization sites.
+
+\paragraph{Wider Minima and Generalization.}
+SPRKD students converge to wider minima than both Control-S and RKD models, associated extensively with stronger generalization, robustness to dataset and activation noise, and clustering below saddle points \citep{chaudhari2019entropy}. This implies convergence to minima stronger than both RKD methods and even Control-S models. While the Control model also achieves relatively wide minima (to a lesser extent than SPRKD), RKD fails on this dimension and accordingly exhibits the lowest task performance.
+
+\paragraph{Sources of Error and Considerations.}
+We considered the top 20 and top 2 eigenvalues for teacher and student models, respectively. While these quantities are sufficient for accurate saddle detection in the regimes we tested, including larger samples may further improve ASR construction and NHE accuracy. The learning capacity of the underlying architecture also plays a role in maximum achievable accuracy: the difference between Control-S and SPRKD may grow for more complex tasks where Control-S itself struggles to converge well.
+
+\paragraph{Implications for KD.}
+Through leveraging teachers as information oracles regarding task optimization landscapes, SPRKD helps shift KD from replication to teacher-driven generalization and performance improvement. Rather than students replicating teachers, the teacher provides critical second-order knowledge to students that allows for boosted task proficiency, accessible regardless of teacher performance.
+
+\section{Conclusion, Limitations, and Future Work}
+
+In the final analysis, all experimental results satisfy our engineering objectives and confirm the end hypothesis, suggesting that SPRKD: (i) converges to more generalizable and higher-quality sites; (ii) enables faster time-to-convergence and descent; (iii) smoothens the optimization landscape; (iv) removes replication-induced accuracy barriers in distillation performance; (v) maximizes student learning capacity via embedded teacher domain and curvature knowledge irrespective of teacher strength; and (vi) enables strong student distillation from computationally cheap weak teachers, broadening edge applications in significantly less compute and development time.
+
+\paragraph{Key Applications.}
+SPRKD has direct implications for (i) compressing large DNNs for widespread deployment without strong teacher training, reducing compute cost and development time on previously unfeasible problems (key hospital settings, low-cost autonomous vehicles, etc.); (ii) enabling DNN-driven solution access to local communities and remote locations in data-scarce settings; (iii) broadening research and innovation by enabling the development of small, high-powered models when strong-teacher-compute-access is insufficient; (iv) sharpening understanding of what elements of DNN models are most valuable to student learning; and (v) accelerating deep learning impact across key problems in unreachable, low-latency, and mission-critical settings (energy production and monitoring, real-time healthcare analysis, robotics equipment, and more).
+
+\paragraph{Limitations and Open Questions.}
+Do findings generalize across non-image-classification tasks and across non-SGD-based optimizers (for example, second-order Newton methods)? How would improved NHE hyperparameter tuning impact performance? Can SPRKD be enhanced in conjunctive use with online and hint-based KD approaches? Is the embedding-principle width constraint a fundamental limitation or an artifact of the specific TLI procedure used? Finally, while we observe strong empirical results, a theoretical proof of convergence for the combined ASR + NHE + PGD optimizer remains future work.
+
+\paragraph{Next Steps.}
+Further experiments across additional problem types, transformer architectures, and datasets (sample-based performance evaluation); real-world deployment and case study (empirical analysis); a SPRKD Distillation UI and API for researchers and industry professionals; and direct comparison against modern KD baselines such as Born Again Networks \citep{furlanello2018born}, Relational KD \citep{park2019relational}, and Similarity-Preserving KD \citep{tung2019similarity}.
+
+\section*{Awards and Recognition}
+This work originated as the first author's research project for the 2023 Regeneron International Science and Engineering Fair (ISEF) and received the following recognitions:
+\begin{itemize}
+    \item \textbf{2nd Place, Mathematical and Cybersecurity Research} from the U.S.~National Security Agency at Regeneron ISEF 2023.
+    \item \textbf{4th Place, Robotics and Intelligent Machines} from Regeneron at ISEF 2023.
+    \item \textbf{Selected to represent Canada} by Youth Science Canada as one of 8 projects at the 2023 Regeneron Science and Engineering Fair in Dallas, Texas.
+\end{itemize}
+
+\section*{Acknowledgements}
+We thank the organizers of the SciComm Viewpoint Challenge for the initial intellectual context, the Team Canada ISEF delegation for support during competition, and reviewers of earlier versions of this work for substantive feedback.
+
+\bibliography{refs}
+
+\end{document}

@@ -1,0 +1,51 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# --- Build / dist ---------------------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+.eggs/
+wheels/
+
+# --- Editable installs ----------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# --- Jupyter --------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- IDE / OS -------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- SPRKD-specific scratch ----------------------------------------------
+scratch/
+runs/
+*.log
+*.tmp
+
+# --- Conda / pip installers (do NOT commit) ------------------------------
+Miniconda3-*.sh
+Miniconda3-*.sh.[0-9]*
+Anaconda3-*.sh

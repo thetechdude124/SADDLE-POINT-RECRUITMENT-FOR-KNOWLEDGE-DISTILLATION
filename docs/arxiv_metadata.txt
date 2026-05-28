@@ -1,0 +1,44 @@
+================================================================
+ARXIV SUBMISSION METADATA
+================================================================
+
+TITLE:
+SPRKD: Effective Knowledge Distillation for Deep Neural Networks via Saddle Region Approximation
+
+AUTHORS (in this order, as they should appear on arXiv):
+Aditya Dewan, Arjun Yogeswaran, Benjamin Fedoruk
+
+PRIMARY CATEGORY:
+cs.LG  (Machine Learning)
+
+CROSS-LIST CATEGORIES (recommended):
+cs.NE  (Neural and Evolutionary Computing)
+stat.ML  (Statistics - Machine Learning)
+
+LICENSE:
+CC BY 4.0 (Creative Commons Attribution)
+
+================================================================
+ABSTRACT (for the arXiv submission form, fits in 1920-char limit)
+================================================================
+
+Knowledge distillation (KD) compresses deep neural networks by training a student to replicate a teacher's outputs, yet such students are empirically bounded by teacher accuracy and KD often acts as label-smoothing regularization rather than substantive knowledge transfer. We propose Saddle Point Recruitment for Knowledge Distillation (SPRKD), reframing distillation from teacher replication to leveraging teachers as proxies for loss-landscape curvature. SPRKD identifies low-loss saddle points encountered by a teacher ensemble via efficient Hessian eigenvalue approximation, aggregates them into an Approximated Saddle Region (ASR), re-parameterizes the ASR into the student via Transfer Learning by Injection, and biases the student toward the ASR with an exponentially decaying Euclidean Distance Matrix transformation. Once near the ASR, the student descends via Negative Hessian Eigensteps and Gaussian Perturbed Gradient Descent perturbations to exploit vetted negative-curvature directions while escaping near-degenerate saddles in time matching SGD first-order stationary point convergence. On a 6,430-parameter CNN distilled from a weak 25,546-parameter teacher for malaria blood smear classification, SPRKD reaches 94.8% validation accuracy, outperforming Response KD by 24.70% (McNemar p = 6.3e-87) and matching a strong scratch-trained control of the same architecture (p = 1.0), distilling solely from a weak teacher. Hessian Eigenvalue Spectral Density analysis and 2-D loss landscape visualization show that SPRKD students converge to flatter, smoother regions with substantially smaller Hessian trace and spectral radius than both Response KD and scratch-trained baselines. These results suggest that effective KD does not require strong teachers, and that second-order, landscape-aware distillation can lift the teacher-imposed accuracy ceiling of conventional KD.
+
+================================================================
+COMMENTS FIELD (optional but recommended)
+================================================================
+
+Originally awarded 2nd Place, Mathematical and Cybersecurity Research (NSA), and 4th Place, Robotics and Intelligent Machines (Regeneron), at Regeneron ISEF 2023; selected by Youth Science Canada to represent Canada at ISEF 2023, Dallas, TX.
+
+================================================================
+SUBMISSION CHECKLIST
+================================================================
+
+[ ] Upload sprkd_arxiv_submission.tar.gz as the source file
+[ ] Verify arXiv's automatic build produces the correct PDF (preview before publishing)
+[ ] Set primary category to cs.LG
+[ ] Add cross-list categories cs.NE and stat.ML
+[ ] Paste the trimmed abstract above into the abstract field
+[ ] Select CC BY 4.0 as the license (irrevocable)
+[ ] Confirm author order: Dewan, Yogeswaran, Fedoruk
+[ ] Add ORCID if you have one (recommended)

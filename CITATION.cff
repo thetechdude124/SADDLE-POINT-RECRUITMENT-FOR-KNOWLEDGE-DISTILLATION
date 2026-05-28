@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use SPRKD in your research, please cite the paper below."
+title: "SPRKD: Effective Knowledge Distillation for Deep Neural Networks via Saddle Region Approximation"
+type: software
+authors:
+  - family-names: Dewan
+    given-names: Aditya
+    email: adewan2@andrew.cmu.edu
+    affiliation: Carnegie Mellon University
+  - family-names: Yogeswaran
+    given-names: Arjun
+    email: arjuny@waymo.com
+    affiliation: Waymo
+  - family-names: Fedoruk
+    given-names: Benjamin
+    email: benjamin.fedoruk@ontariotechu.net
+    affiliation: Ontario Tech University
+repository-code: "https://github.com/thetechdude124/SADDLE-POINT-RECRUITMENT-FOR-KNOWLEDGE-DISTILLATION"
+license: MIT
+keywords:
+  - knowledge distillation
+  - saddle points
+  - hessian
+  - second-order optimization
+  - deep learning
+  - model compression
+  - loss landscape
+preferred-citation:
+  type: article
+  title: "SPRKD: Effective Knowledge Distillation for Deep Neural Networks via Saddle Region Approximation"
+  authors:
+    - family-names: Dewan
+      given-names: Aditya
+    - family-names: Yogeswaran
+      given-names: Arjun
+    - family-names: Fedoruk
+      given-names: Benjamin
+  year: 2024
+  abstract: >-
+    Knowledge distillation (KD) is the dominant paradigm for compressing large
+    deep neural networks into deployable lightweight models. Standard KD
+    optimizes a student to replicate teacher output logits, yet empirical and
+    theoretical work indicates that the resulting students are bounded by
+    teacher accuracy, exhibit hampered long-term convergence, and that KD acts
+    effectively as a form of label-smoothing regularization rather than
+    substantive knowledge transfer. We propose Saddle Point Recruitment for
+    Knowledge Distillation (SPRKD), a method that reframes the fundamental
+    objective of distillation from teacher replication to leveraging teachers
+    as proxies for loss-landscape curvature information.
