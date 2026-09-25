@@ -17,9 +17,8 @@ applying ``fn_inject`` element-wise is functionally equivalent to the full
 graph-matching TLI of the original ``tli-pytorch`` package while avoiding the
 heavy ``karateclub`` / ``timm`` / ``graphviz`` dependencies.
 
-For cross-architecture injection (e.g. ResNet-101 -> ResNet-18 of Experiment
-2) install the optional ``[tli-full]`` extras and use
-:func:`sprkd.tli.transfer_via_graph`.
+Cross-architecture graph matching (``transfer_via_graph``) is not vendored; it raises
+``NotImplementedError`` and points at the upstream package.
 
 References
 ----------
@@ -170,36 +169,50 @@ def inject_state_list(
     student: nn.Module,
     state_tensors: List[torch.Tensor],
     teacher: nn.Module | None = None,
-) -> None:
+) -> List[Tuple[str, str]]:
     """Inject a flat list of tensors (e.g. an averaged ASR) into ``student``.
 
-    The list must align positionally with ``student.parameters()`` (this is
-    the layout used by :class:`sprkd.saddle.SaddlePointRepository`).
+    Two modes:
+
+    * ``teacher`` given: ``state_tensors`` must align with ``teacher.parameters()``
+      (the layout produced by :class:`sprkd.saddle.SaddlePointRepository` for that
+      teacher). The tensors are loaded into the teacher module and injected into the
+      student by state-dict key matching plus center crop/pad (:func:`simple_inject`).
+      This works for depth-mismatched pairs (e.g. resnet32x4 -> resnet8x4) and for a
+      teacher smaller than the student; unmatched student tensors keep their values.
+    * no ``teacher``: ``state_tensors`` must align positionally with
+      ``student.parameters()`` and are injected tensor-by-tensor.
+
+    Returns the list of ``(student_key, teacher_key)`` pairs that were injected
+    (positional pairs are reported as ``("param_i", "param_i")``).
     """
 
     student_params = list(student.parameters())
+
+    if teacher is not None:
+        teacher_params = list(teacher.parameters())
+        if len(teacher_params) != len(state_tensors):
+            raise ValueError(
+                "inject_state_list with teacher expects one tensor per teacher "
+                f"parameter ({len(teacher_params)}); got {len(state_tensors)}"
+            )
+        for tp, ts in zip(teacher_params, state_tensors):
+            if tp.shape != ts.shape:
+                raise ValueError(
+                    f"state tensor shape {tuple(ts.shape)} does not match teacher "
+                    f"parameter shape {tuple(tp.shape)}"
+                )
+            tp.data.copy_(ts.to(dtype=tp.dtype, device=tp.device))
+        return simple_inject(student, teacher)
+
     if len(state_tensors) != len(student_params):
         raise ValueError(
             "inject_state_list expects one tensor per student parameter "
             f"({len(student_params)}); got {len(state_tensors)}"
         )
-
-    if teacher is not None:
-        # Match the legacy notebook flow: load tensors into the teacher first
-        # (where shapes line up), then run shape-aware injection.
-        teacher_params = list(teacher.parameters())
-        if len(teacher_params) != len(state_tensors):
-            raise ValueError(
-                "inject_state_list with teacher expects matching parameter "
-                f"counts ({len(teacher_params)}); got {len(state_tensors)}"
-            )
-        for tp, ts in zip(teacher_params, state_tensors):
-            tp.data.copy_(ts.to(dtype=tp.dtype, device=tp.device))
-        simple_inject(student, teacher)
-        return
-
     for sp, ts in zip(student_params, state_tensors):
         fn_inject(ts.to(dtype=sp.dtype, device=sp.device), sp.data)
+    return [(f"param_{i}", f"param_{i}") for i in range(len(student_params))]
 
 
 # ---------------------------------------------------------------------------
@@ -207,25 +220,18 @@ def inject_state_list(
 # ---------------------------------------------------------------------------
 
 def transfer_via_graph(student: nn.Module, teacher: nn.Module, **kwargs):
-    """Full TLI via the original ``tli-pytorch`` graph-matching algorithm.
+    """Full graph-matching TLI (Czyzewski 2020) for heterogeneous architectures.
 
-    This requires the ``[tli-full]`` extras (``networkx``, ``graphviz``,
-    ``karateclub``). Used in the paper for ResNet-101 -> ResNet-18 of
-    Experiment 2.
-
-    Raises
-    ------
-    ImportError
-        If the ``[tli-full]`` extras are not installed.
+    Not implemented in this package: the original ``tli-pytorch`` code (with its
+    ``karateclub`` / ``networkx`` / ``graphviz`` dependencies) is not vendored. The
+    TinyImageNet ResNet-101 -> ResNet-18 experiment in the paper used the upstream
+    implementation directly (see ``notebooks/SPRKD.ipynb``, cell 18). Use
+    :func:`simple_inject` for same-family pairs, or install and call
+    ``tli.transfer`` from https://github.com/maciejczyzewski/tli-pytorch yourself.
     """
 
-    try:
-        from sprkd._tli_vendor import transfer  # type: ignore[attr-defined]
-    except ImportError as e:  # pragma: no cover - optional path
-        raise ImportError(
-            "transfer_via_graph requires the 'tli-full' extras. "
-            "Install with: pip install 'sprkd[tli-full]' "
-            "and ensure sprkd/_tli_vendor.py is present."
-        ) from e
-
-    return transfer(teacher, student, inject=True, **kwargs)
+    raise NotImplementedError(
+        "transfer_via_graph is not available: the graph-matching TLI implementation "
+        "is not vendored in this package. Use sprkd.tli.simple_inject for same-family "
+        "architectures or the upstream tli-pytorch package (MIT) for heterogeneous ones."
+    )
