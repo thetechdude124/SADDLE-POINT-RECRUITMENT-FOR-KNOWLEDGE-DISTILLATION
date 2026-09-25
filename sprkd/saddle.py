@@ -1,33 +1,26 @@
 """Saddle-point detection and Approximated Saddle Region (ASR) construction.
 
-Two paper-faithful detection rules are exposed (paper Section 3.1, Eq. 1):
+Detection rules (paper Section 3.1, Eq. 1). ``Lambda`` is the set of estimated top
+Hessian eigenvalues at a training step:
 
-* ``"magnitude"`` (default, used in the canonical Colab notebook
-  ``SPRKD_SADDLE_POINT_RECRUITMENT_FOR_KNOWLEDGE_DISTILLATION_ADITYA_DEWAN_2023``):
+* ``"magnitude"`` (default; the rule used by the canonical Colab notebook and the released
+  checkpoints): ``|sum_{lambda_i < 0} lambda_i| >= beta`` with ``beta = 7``.
+* ``"ratio"`` (the original ISEF 2023 notebook): ``|sum neg| >= alpha * sum pos`` with
+  ``alpha = 0.4``.
+* ``"both"`` (paper Equation 1 read literally): both conditions.
 
-  .. math::
-
-      \\Big| \\sum_{\\lambda_i < 0} \\lambda_i \\Big| \\;\\ge\\; \\beta,
-      \\qquad \\beta = 7
-
-  This is the rule used to populate ``TRUE_MALARIA_ENSEMBLE_TEACHER_SADDLE_POINTS.pth``
-  and the released SPRKD checkpoints.
-
-* ``"ratio"`` (the alpha-ratio rule from the original ISEF 2023 notebook):
-
-  .. math::
-
-      \\Big| \\sum_{\\lambda_i < 0} \\lambda_i \\Big| \\;\\ge\\;
-      \\alpha \\, \\sum_{\\lambda_i > 0} \\lambda_i,
-      \\qquad \\alpha = 0.4
-
-* ``"both"`` (paper Equation 1 read literally): both conditions must hold.
+All three rules can additionally be gated on the gradient norm
+(``SaddleCriterion.max_grad_norm``): a true saddle has a vanishing gradient, and without
+the gate the rules fire on ordinary early-training iterates that merely have some
+negative curvature. The gate is off by default (``None``) so that released behaviour is
+reproducible; every detection is logged with its gradient norm so the gate can be chosen
+after the fact.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Literal, Optional, Sequence
+from typing import Iterable, List, Literal, Optional, Sequence, Union
 
 import torch
 
@@ -42,26 +35,21 @@ class SaddleCriterion:
     Parameters
     ----------
     rule : {"magnitude", "ratio", "both"}, default ``"magnitude"``
-        Which condition to enforce. ``"magnitude"`` matches the canonical
-        Colab notebook and the released checkpoints. ``"ratio"`` matches the
-        original ISEF 2023 notebook. ``"both"`` enforces paper Equation 1
-        literally (the conjunction of the two).
     alpha : float
-        Negative-eigenvalue magnitude *ratio* threshold (paper's
-        :math:`\\alpha`, used by ``"ratio"`` and ``"both"``). Default ``0.4``.
+        Ratio threshold (paper's :math:`\\alpha`), used by ``"ratio"`` and ``"both"``.
     magnitude_threshold : float
-        Lower bound on the absolute negative-eigenvalue mass (paper's
-        :math:`\\beta`, used by ``"magnitude"`` and ``"both"``). Default
-        ``7.0``.
+        Absolute negative-eigenvalue mass threshold (paper's :math:`\\beta`).
     require_negative_eigenvalue : bool
-        If ``True`` (default), at least one strictly negative eigenvalue
-        must be present.
+        At least one strictly negative eigenvalue must be present.
+    max_grad_norm : float or None
+        If set, a step qualifies only when the gradient L2 norm is at most this value.
     """
 
     rule: _RuleName = "magnitude"
     alpha: float = 0.4
     magnitude_threshold: float = 7.0
     require_negative_eigenvalue: bool = True
+    max_grad_norm: Optional[float] = None
 
 
 def _split_signs(eigenvalues: Sequence[float]):
@@ -77,118 +65,178 @@ def _split_signs(eigenvalues: Sequence[float]):
     return pos, neg, zero
 
 
-def is_strong_saddle_point(
+def which_rules_fire(
     eigenvalues: Sequence[float],
     criterion: Optional[SaddleCriterion] = None,
-) -> bool:
-    """Return ``True`` iff ``eigenvalues`` qualify as a strong saddle point.
+    grad_norm: Optional[float] = None,
+) -> dict:
+    """Evaluate every condition and return a dict of booleans plus the decision.
 
-    See the module docstring for the three available rules. The default rule
-    matches the canonical SPRKD Colab notebook exactly:
-
-    .. code-block:: python
-
-        # canonical (latest notebook)
-        if abs(sum(neg_eigs)) >= 7:
-            ...
+    Keys: ``magnitude``, ``ratio``, ``grad_gate`` (True when the gate passes or is off),
+    ``has_negative``, ``fired`` (the final decision for ``criterion.rule``).
     """
 
     if criterion is None:
         criterion = SaddleCriterion()
 
     pos, neg, _ = _split_signs(eigenvalues)
-    if criterion.require_negative_eigenvalue and not neg:
-        return False
-
     pos_mass = sum(pos)
     neg_mass = abs(sum(neg))
+    out = {
+        "has_negative": bool(neg),
+        "ratio": bool(neg_mass >= criterion.alpha * pos_mass),
+        "magnitude": bool(neg_mass >= criterion.magnitude_threshold),
+        "grad_gate": bool(
+            criterion.max_grad_norm is None
+            or grad_norm is None
+            or grad_norm <= criterion.max_grad_norm
+        ),
+        "neg_mass": neg_mass,
+        "pos_mass": pos_mass,
+    }
+    if criterion.require_negative_eigenvalue and not out["has_negative"]:
+        fired = False
+    elif criterion.rule == "magnitude":
+        fired = out["magnitude"]
+    elif criterion.rule == "ratio":
+        fired = out["ratio"]
+    elif criterion.rule == "both":
+        fired = out["ratio"] and out["magnitude"]
+    else:
+        raise ValueError(f"Unknown saddle rule: {criterion.rule!r}")
+    out["fired"] = bool(fired and out["grad_gate"])
+    return out
 
-    ratio_ok = neg_mass >= (criterion.alpha * pos_mass)
-    magnitude_ok = neg_mass >= criterion.magnitude_threshold
 
-    if criterion.rule == "magnitude":
-        return bool(magnitude_ok)
-    if criterion.rule == "ratio":
-        return bool(ratio_ok)
-    if criterion.rule == "both":
-        return bool(ratio_ok and magnitude_ok)
-    raise ValueError(f"Unknown saddle rule: {criterion.rule!r}")
+def is_strong_saddle_point(
+    eigenvalues: Sequence[float],
+    criterion: Optional[SaddleCriterion] = None,
+    grad_norm: Optional[float] = None,
+) -> bool:
+    """Return ``True`` iff ``eigenvalues`` (and optionally ``grad_norm``) qualify."""
+
+    return which_rules_fire(eigenvalues, criterion, grad_norm)["fired"]
 
 
 @dataclass
 class SaddlePointRepository:
-    """A growing collection of (loss, params) snapshots, one per teacher.
+    """Snapshots of qualifying parameter states for one teacher.
 
-    The :meth:`append` method clones-and-detaches the parameters into CPU
-    storage to avoid memory pressure, matching the behaviour of the original
-    SPRKD notebook implementation.
+    Each ``append`` stores a CPU clone of the parameters together with the loss, the
+    gradient norm and the rule outcome at that step. With ``top_k`` set, only the ``top_k``
+    lowest-loss snapshots are retained (the worst is dropped on overflow).
     """
 
     teacher_index: int
+    top_k: Optional[int] = None
     snapshots: List[List[torch.Tensor]] = field(default_factory=list)
     losses: List[float] = field(default_factory=list)
+    grad_norms: List[float] = field(default_factory=list)
+    steps: List[int] = field(default_factory=list)
+    rules: List[dict] = field(default_factory=list)
+    n_checked: int = 0
+    n_dropped: int = 0
 
     def append(
         self,
         params: Iterable[torch.nn.Parameter],
         loss: Optional[float] = None,
+        *,
+        grad_norm: Optional[float] = None,
+        step: Optional[int] = None,
+        rule: Optional[dict] = None,
     ) -> None:
         cpu_snap = [p.clone().detach().to("cpu") for p in params]
         self.snapshots.append(cpu_snap)
         self.losses.append(float(loss) if loss is not None else float("nan"))
+        self.grad_norms.append(float(grad_norm) if grad_norm is not None else float("nan"))
+        self.steps.append(int(step) if step is not None else -1)
+        self.rules.append(dict(rule) if rule is not None else {})
+        if self.top_k is not None and len(self.snapshots) > self.top_k:
+            self._drop_worst()
+
+    def _drop_worst(self) -> None:
+        finite = [(i, l) for i, l in enumerate(self.losses) if l == l]
+        idx = max(finite, key=lambda kv: kv[1])[0] if finite else 0
+        for lst in (self.snapshots, self.losses, self.grad_norms, self.steps, self.rules):
+            del lst[idx]
+        self.n_dropped += 1
 
     def __len__(self) -> int:  # noqa: D401 - magic method
         return len(self.snapshots)
 
     @property
+    def best_index(self) -> int:
+        if not self.snapshots:
+            raise IndexError("SaddlePointRepository is empty.")
+        finite = [(i, l) for i, l in enumerate(self.losses) if l == l]  # NaN-safe
+        if not finite:
+            return len(self.snapshots) - 1
+        return min(finite, key=lambda kv: kv[1])[0]
+
+    @property
     def best(self) -> List[torch.Tensor]:
         """Lowest-loss snapshot, or the most recent one if losses are unset."""
 
-        if not self.snapshots:
-            raise IndexError("SaddlePointRepository is empty.")
+        return self.snapshots[self.best_index]
 
-        finite = [(i, l) for i, l in enumerate(self.losses) if l == l]  # NaN-safe
-        if not finite:
-            return self.snapshots[-1]
-        idx = min(finite, key=lambda kv: kv[1])[0]
-        return self.snapshots[idx]
+    def summary(self) -> dict:
+        return {
+            "teacher_index": self.teacher_index,
+            "n_checked": self.n_checked,
+            "n_recorded": len(self.snapshots),
+            "n_dropped": self.n_dropped,
+            "losses": list(self.losses),
+            "grad_norms": list(self.grad_norms),
+            "steps": list(self.steps),
+            "best_index": self.best_index if self.snapshots else None,
+        }
+
+
+_RepoLike = Union[SaddlePointRepository, Sequence[List[torch.Tensor]]]
+
+
+def _select(repo: _RepoLike, select: str) -> Optional[List[torch.Tensor]]:
+    if isinstance(repo, SaddlePointRepository):
+        if len(repo) == 0:
+            return None
+        return repo.best if select == "best" else repo.snapshots[-1]
+    if len(repo) == 0:
+        return None
+    return repo[-1]  # plain snapshot lists carry no losses: last is the only option
 
 
 def aggregate_asr(
-    repositories: Sequence[Sequence[List[torch.Tensor]]],
+    repositories: Sequence[_RepoLike],
     device: Optional[torch.device] = None,
+    select: str = "best",
 ) -> List[torch.Tensor]:
-    """Average the *last* (lowest-loss) snapshot from each teacher.
-
-    This matches Section 3.2 of the paper: the lowest-loss saddle point per
-    teacher is averaged into a single ASR.
+    """Average one snapshot per teacher into the Approximated Saddle Region.
 
     Parameters
     ----------
-    repositories : Sequence[Sequence[List[Tensor]]]
-        Either a list of lists of tensor-lists (per-teacher snapshots), or a
-        dict-like mapping ``{teacher_index: List[List[Tensor]]}`` (flatten
-        with ``list(d.values())`` first).
-    device : torch.device, optional
-        Device to materialise the resulting ASR tensors on. ``None`` keeps
-        them on the device of the first teacher's snapshot.
-
-    Returns
-    -------
-    List[torch.Tensor]
-        One tensor per layer, averaged across teachers.
+    repositories
+        One :class:`SaddlePointRepository` per teacher (recommended: the lowest-loss
+        snapshot of each is used, matching paper Section 3.2), or a plain list of
+        snapshot-lists per teacher (no losses are available, so the last snapshot is used).
+    device
+        Device for the returned tensors (default: keep the first snapshot's device).
+    select : {"best", "last"}
+        Which snapshot to take from each repository.
     """
 
+    if select not in {"best", "last"}:
+        raise ValueError(f"select must be 'best' or 'last', got {select!r}")
     if not repositories:
         raise ValueError("Cannot aggregate an empty list of repositories.")
 
-    last_snaps = [repo[-1] for repo in repositories if len(repo) > 0]
-    if not last_snaps:
+    chosen = [s for s in (_select(r, select) for r in repositories) if s is not None]
+    if not chosen:
         raise ValueError("All repositories are empty - nothing to aggregate.")
 
-    n = len(last_snaps)
-    base = [t.clone().detach().float() for t in last_snaps[0]]
-    for snap in last_snaps[1:]:
+    n = len(chosen)
+    base = [t.clone().detach().float() for t in chosen[0]]
+    for snap in chosen[1:]:
         for i, t in enumerate(snap):
             base[i] = base[i] + t.detach().to(base[i].device).float()
 
@@ -207,16 +255,10 @@ def estimate_top_eigenvalues(
 ):
     """Estimate the top-``top_n`` Hessian eigenvalues using PyHessian.
 
-    Thin wrapper around :class:`pyhessian.hessian` that handles device
-    detection so the rest of the package does not need to import PyHessian
-    directly.
+    Train/eval mode and gradients of ``model`` are preserved (see
+    :mod:`sprkd.hessian_utils`).
     """
 
-    from pyhessian import hessian as PyHessian
+    from sprkd.hessian_utils import top_eigenpairs
 
-    if use_cuda is None:
-        use_cuda = next(model.parameters()).is_cuda
-
-    hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
-    eigenvalues, eigenvectors = hess.eigenvalues(top_n=top_n)
-    return eigenvalues, eigenvectors
+    return top_eigenpairs(model, criterion, data, top_n=top_n)
