@@ -3,6 +3,41 @@
 All notable changes to the SPRKD package are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-09-25 (corrections)
+
+### Fixed
+- `MalariaTeacherCNN` / `MalariaStudentCNN` return logits; the trailing `nn.Softmax`
+  meant `CrossEntropyLoss` saw a double softmax. Checkpoints load unchanged.
+- `train_response_kd` uses the standard Hinton loss
+  `alpha * CE + (1 - alpha) * T^2 * KL` on logits (alpha 0.5, T 4 by default). The
+  previous loss had no label term and was applied to softmax outputs at T = 1, so the
+  arXiv v1 Response KD comparison (24.7 points) is not a valid comparison.
+- All PyHessian calls preserve train/eval mode and gradients (`sprkd.hessian_utils`).
+  Previously teachers ran with dropout disabled after the first saddle check of each
+  epoch and the NHE step never modified a parameter.
+- Negative Hessian Eigenstep is a negative-curvature step
+  `theta -= eta * sign(g.v) * v` with revert on loss increase; the NHE + PGD event is
+  reverted as a whole when it fails to lower the batch loss. Event counters via
+  `SPRKD.counters()`.
+- `aggregate_asr` averages each teacher's lowest-loss snapshot (accepts
+  `SaddlePointRepository` objects); `SaddlePointRepository` records loss, gradient
+  norm, step and rule outcome, and supports top-k retention.
+- `SaddleCriterion.max_grad_norm` gradient-norm gate (off by default).
+- `inject_state_list` supports depth-mismatched pairs and a teacher smaller than the
+  student when a teacher module is supplied.
+- TinyImageNet validation images are normalised like the training images.
+- `transfer_via_graph` raises `NotImplementedError` instead of importing a module that
+  is not shipped.
+
+### Changed
+- Defaults aligned with the paper and the notebook's final run: `pgd_grad_threshold`
+  0.02 (was 0.01), `pgd_delta` 0.25 (was 5.0).
+- README gains an "Errata and corrections" section. The CIFAR-100 and MNIST numbers in
+  the v1 text have no code in this repository.
+
+### Added
+- `tests/test_fixes.py` (regression tests, one per correction).
+
 ## [0.1.0] - 2026 (paper release)
 
 ### Added

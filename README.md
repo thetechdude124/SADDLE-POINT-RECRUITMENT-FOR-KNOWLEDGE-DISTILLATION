@@ -18,10 +18,49 @@ paper. The full PDF is at [`docs/sprkd_paper.pdf`](docs/sprkd_paper.pdf).
 
 ---
 
+## Errata and corrections (September 2026)
+
+On revisiting the code for a follow-up study we found several issues that affect the
+results reported in the arXiv v1 preprint. They are fixed on the `main` branch as of
+version 0.2.0; the regression tests are in `tests/test_fixes.py` and a line-by-line
+comparison of paper, notebook and package values is in the follow-up repository's
+`neurips/04_paper_vs_code_reconciliation.md`.
+
+- **Response KD baseline.** The v1 baseline was trained on a KL term only (no label
+  term, temperature 1) applied to outputs that already passed through a Softmax layer
+  inside the model. The student therefore never saw the task labels, and the 24.7-point
+  gap to SPRKD reported in Table 1 is not a valid comparison between distillation methods.
+  `train_response_kd` now uses the standard Hinton loss on logits with a configurable
+  label weight and temperature.
+- **Softmax inside the models.** `MalariaTeacherCNN` / `MalariaStudentCNN` ended in
+  `nn.Softmax` while training used `CrossEntropyLoss`. The models now return logits.
+  Released checkpoints load unchanged and their predictions are identical.
+- **PyHessian side effects.** Hessian calls left the model in eval mode and cleared all
+  gradients. As a consequence the Negative Hessian Eigenstep in the released optimizer
+  never modified a parameter, and teachers trained with per-step saddle tracking ran with
+  dropout disabled. Both are fixed (`sprkd.hessian_utils`); the NHE step is now a proper
+  negative-curvature step with the revert described in the paper, and event counters are
+  exposed.
+- **Saddle-region aggregation.** The notebook that produced the released numbers did not
+  aggregate across teachers (an out-of-place `add`), so its multi-teacher region was a
+  single scaled snapshot. `aggregate_asr` now averages each teacher's lowest-loss snapshot.
+- **Supplementary benchmarks.** The CIFAR-100 and MNIST numbers quoted in the v1 text
+  have no code or logs in this repository and should not be relied on.
+- **Reproduction.** The released `MODELS/*.pth` are 10-epoch checkpoints; evaluating them
+  does not reproduce the 500-epoch Table 1 values, and epoch-level means of the bundled
+  500-epoch logs do not show SPRKD above the scratch-trained control.
+
+A corrected evaluation with fixed splits, multiple seeds, a proper KD baseline and
+standard CIFAR-100 teacher/student pairs is in progress. Until it is published, please
+treat the v1 accuracy comparisons as superseded.
+
+---
+
 ## TL;DR
 
-Standard knowledge distillation (KD) caps a student's accuracy at the
-teacher's; SPRKD does not.
+SPRKD initialises a student from curvature-selected snapshots of a weak teacher's
+training trajectory and then trains it on the task labels; see the errata above before
+relying on the accuracy comparisons in the v1 preprint.
 
 SPRKD reframes distillation from *replicating teacher outputs* to *recruiting
 teacher saddle points*. Concretely, SPRKD:
