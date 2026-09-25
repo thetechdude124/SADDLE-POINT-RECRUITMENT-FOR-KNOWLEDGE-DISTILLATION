@@ -334,10 +334,9 @@ def make_tinyimagenet_dataloaders(
     valid_transform = transforms.Compose(
         [
             transforms.Lambda(lambda x: x.convert("RGB")),
+            transforms.Resize((config.image_size, config.image_size)),
             transforms.ToTensor(),
-            transforms.Resize(
-                (config.image_size, config.image_size), antialias=True
-            ),
+            transforms.Normalize(mean=list(TINYIMAGENET_MEAN), std=list(TINYIMAGENET_STD)),
         ]
     )
 
