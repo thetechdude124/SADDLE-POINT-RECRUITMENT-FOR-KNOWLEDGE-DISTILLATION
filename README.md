@@ -21,8 +21,8 @@ paper. The full PDF is at [`docs/sprkd_paper.pdf`](docs/sprkd_paper.pdf).
 ## Errata and corrections (September 2026)
 
 On revisiting the code for a follow-up study we found several issues that affect the
-results reported in the arXiv v1 preprint. They are fixed on the `main` branch as of
-version 0.2.0; the regression tests are in `tests/test_fixes.py` and a line-by-line
+results reported in the arXiv v1 preprint. They are fixed as of version 0.2.0
+(merged into the default branch); the regression tests are in `tests/test_fixes.py` and a line-by-line
 comparison of paper, notebook and package values is in
 [`docs/RECONCILIATION.md`](docs/RECONCILIATION.md).
 
