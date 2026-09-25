@@ -191,6 +191,33 @@ def train_student(
     return sprkd, history
 
 
+def kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    alpha: float = 0.5,
+    temperature: float = 4.0,
+) -> torch.Tensor:
+    """Standard Hinton (2015) distillation loss on logits.
+
+    ``alpha * CE(student, y) + (1 - alpha) * T^2 * KL(softmax(t/T) || softmax(s/T))``.
+    The ``T^2`` factor keeps the soft-target gradient magnitude comparable across
+    temperatures. CRD (Tian et al. 2020) uses ``alpha = 0.1, T = 4`` on CIFAR-100; the
+    default here is ``alpha = 0.5``.
+    """
+
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    ce = nn.functional.cross_entropy(student_logits, targets)
+    log_p_s = torch.log_softmax(student_logits / temperature, dim=1)
+    p_t = torch.softmax(teacher_logits / temperature, dim=1)
+    kl = nn.functional.kl_div(log_p_s, p_t, reduction="batchmean") * (temperature ** 2)
+    return alpha * ce + (1.0 - alpha) * kl
+
+
 def train_response_kd(
     student: nn.Module,
     teacher: nn.Module,
@@ -199,13 +226,17 @@ def train_response_kd(
     *,
     n_epochs: int,
     lr: float = 1e-3,
-    temperature: float = 1.0,
+    temperature: float = 4.0,
+    alpha: float = 0.5,
     device: Optional[torch.device] = None,
     progress: bool = True,
 ) -> TrainingHistory:
-    """Standard Response KD (Hinton et al. 2015) for direct comparison.
+    """Response KD baseline (Hinton et al. 2015) with the standard combined loss.
 
-    Loss = ``KL(softmax(student/T) || softmax(teacher/T))``.
+    Same optimizer (Adam, ``lr``) and epoch budget as the other arms. ``alpha`` is
+    the weight on the cross-entropy term, ``1 - alpha`` on the ``T^2``-scaled KL
+    term; see :func:`kd_loss`. Validation loss and accuracy are computed with plain
+    cross-entropy on the task labels so they are comparable across arms.
     """
 
     device = device or next(student.parameters()).device
@@ -213,7 +244,6 @@ def train_response_kd(
     teacher.to(device)
     teacher.eval()
     optimizer = torch.optim.Adam(student.parameters(), lr=lr)
-    kl = nn.KLDivLoss(reduction="batchmean")
 
     history = TrainingHistory()
     iterator = range(n_epochs)
@@ -222,19 +252,17 @@ def train_response_kd(
 
     for epoch in iterator:
         student.train()
-        for x, _y in train_loader:
-            x = x.to(device)
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
             with torch.no_grad():
                 t_logits = teacher(x)
             s_logits = student(x)
-            log_s = torch.log_softmax(s_logits / temperature, dim=1)
-            soft_t = torch.softmax(t_logits / temperature, dim=1)
-            loss = kl(log_s, soft_t)
+            loss = kd_loss(s_logits, t_logits, y, alpha=alpha, temperature=temperature)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             history.train_losses.append(loss.item())
-            history.train_accuracies.append(_accuracy(s_logits, _y.to(device)))
+            history.train_accuracies.append(_accuracy(s_logits, y))
         v_loss, v_acc = _epoch_eval(
             student, valid_loader, nn.CrossEntropyLoss(), device
         )
