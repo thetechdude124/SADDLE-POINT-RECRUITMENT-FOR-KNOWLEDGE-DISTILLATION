@@ -48,13 +48,16 @@ def compute_spectrum(
 
     from pyhessian import hessian as PyHessian
 
+    from sprkd.hessian_utils import preserve_model_state
+
     if use_cuda is None:
         use_cuda = next(model.parameters()).is_cuda
 
-    hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
-    eigenvalues, weights = hess.density(iter=n_iter, n_v=n_v)
-    trace = float(np.mean(hess.trace()))
-    top_eigs, _ = hess.eigenvalues(top_n=1)
+    with preserve_model_state(model):
+        hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
+        eigenvalues, weights = hess.density(iter=n_iter, n_v=n_v)
+        trace = float(np.mean(hess.trace()))
+        top_eigs, _ = hess.eigenvalues(top_n=1)
     top = float(top_eigs[0]) if len(top_eigs) > 0 else 0.0
     return HessianSpectrum(
         eigenvalues=eigenvalues,
@@ -110,7 +113,10 @@ def hessian_trace(
 
     from pyhessian import hessian as PyHessian
 
+    from sprkd.hessian_utils import preserve_model_state
+
     if use_cuda is None:
         use_cuda = next(model.parameters()).is_cuda
-    hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
-    return float(np.mean(hess.trace(maxIter=n_iter)))
+    with preserve_model_state(model):
+        hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
+        return float(np.mean(hess.trace(maxIter=n_iter)))

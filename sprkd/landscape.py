@@ -101,15 +101,9 @@ def compute_top2_eigenpairs(
     ``model.parameters()``.
     """
 
-    from pyhessian import hessian as PyHessian
+    from sprkd.hessian_utils import top_eigenpairs
 
-    model, data, use_cuda, original = _to_pyhessian_compat(model, data)
-    try:
-        hess = PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
-        eigs, vecs = hess.eigenvalues(top_n=2)
-    finally:
-        if next(model.parameters()).device != original:
-            model.to(original)
+    eigs, vecs = top_eigenpairs(model, criterion, data, top_n=2)
     return [float(e) for e in eigs], vecs
 
 
