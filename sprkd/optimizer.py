@@ -224,6 +224,7 @@ class SPRKD(torch.optim.Optimizer):
         self._n_pgd_reverted: int = 0       # NHE + PGD events undone
         self._n_pgd_considered: int = 0     # trigger conditions met
         self._nhe_eigenvalues: List[float] = []
+        self.events: List[dict] = []        # one record per NHE / PGD event (for inspection)
 
     # ------------------------------------------------------------------ utils
     @property
@@ -478,7 +479,13 @@ class SPRKD(torch.optim.Optimizer):
                     p.data = p.data + std * torch.randn_like(p.data)
 
             post_loss = batch_loss(model, self.loss_fn, data_batch)
-            if group["revert_on_increase"] and post_loss >= pre_loss:
+            reverted = bool(group["revert_on_increase"] and post_loss >= pre_loss)
+            self.events.append({
+                "kind": "pgd", "step": self._step_count, "param_index": i, "grad_norm": float(grad_norm),
+                "avg_distance": float(avg_distance), "std": std, "pre_loss": pre_loss, "post_loss": post_loss,
+                "reverted": reverted,
+            })
+            if reverted:
                 with torch.no_grad():
                     for q, s in zip(group["params"], snapshot):
                         q.data.copy_(s)
@@ -552,7 +559,12 @@ class SPRKD(torch.optim.Optimizer):
                 self._nhe_eigenvalues.append(lam)
 
         post_loss = batch_loss(model, self.loss_fn, data_batch)
-        if group["revert_on_increase"] and post_loss > pre_loss:
+        reverted = bool(group["revert_on_increase"] and post_loss > pre_loss)
+        self.events.append({
+            "kind": "nhe", "step": self._step_count, "eigenvalues": [float(e) for e in top_eigs],
+            "n_negative": len(negatives), "pre_loss": pre_loss, "post_loss": post_loss, "reverted": reverted,
+        })
+        if reverted:
             with torch.no_grad():
                 for q, s in zip(params, snapshot):
                     q.data.copy_(s)

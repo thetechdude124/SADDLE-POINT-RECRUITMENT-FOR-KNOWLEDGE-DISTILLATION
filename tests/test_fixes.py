@@ -252,3 +252,15 @@ def test_fix7_tinyimagenet_val_is_normalised(tmp_path):
 def test_fix8_transfer_via_graph_raises_clear_error():
     with pytest.raises(NotImplementedError, match="not vendored"):
         transfer_via_graph(MalariaStudentCNN(), MalariaTeacherCNN())
+
+
+def test_fix3_events_are_recorded():
+    x = torch.zeros(4, 1); y = torch.zeros(4, dtype=torch.long)
+    model = _QuadraticSaddle()
+    opt = SPRKD([model.w], base_optimizer=torch.optim.SGD([model.w], lr=0.1), loss_fn=_MeanLoss(),
+                teacher_saddle_points=[torch.zeros(2)], nhe_step_mode="fixed", nhe_step_size=0.2,
+                hessian_factory=_stub_factory(-1.0, [0.0, 1.0]))
+    _MeanLoss()(model(x), y).backward()
+    opt._negative_hessian_eigenstep(group=opt.param_groups[0], model=model, data_batch=(x, y))
+    assert len(opt.events) == 1 and opt.events[0]["kind"] == "nhe"
+    assert opt.events[0]["post_loss"] < opt.events[0]["pre_loss"] and not opt.events[0]["reverted"]
