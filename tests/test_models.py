@@ -44,11 +44,14 @@ def test_forward_shapes():
     assert MalariaStudentCNN()(x).shape == (2, 2)
 
 
-def test_forward_outputs_are_probabilities():
+def test_forward_outputs_are_logits():
+    """Models return logits; softmax is applied by the loss, not the model."""
     x = torch.randn(4, 3, 32, 32)
-    out = MalariaTeacherCNN()(x)
-    assert torch.allclose(out.sum(dim=1), torch.ones(4), atol=1e-5)
-    assert (out >= 0).all() and (out <= 1).all()
+    for m in (MalariaTeacherCNN(), MalariaStudentCNN()):
+        assert not any(isinstance(mod, torch.nn.Softmax) for mod in m.modules())
+        out = m(x)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(torch.softmax(out, dim=1).sum(dim=1), torch.ones(4), atol=1e-5)
 
 
 def test_models_are_trainable():

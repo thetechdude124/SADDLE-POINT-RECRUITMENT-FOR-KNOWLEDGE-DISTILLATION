@@ -141,5 +141,7 @@ def test_load_legacy_student_via_public_api_runs_inference():
     with torch.no_grad():
         out = model(x)
     assert out.shape == (2, 2)
-    # outputs are softmax probabilities (model definition includes softmax)
-    assert torch.allclose(out.sum(dim=1), torch.ones(2), atol=1e-4)
+    # outputs are logits (the Softmax layer was removed from the model definition;
+    # legacy checkpoints load unchanged because that layer had no parameters)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(torch.softmax(out, dim=1).sum(dim=1), torch.ones(2), atol=1e-4)

@@ -1,5 +1,11 @@
 """Reference architectures used in the SPRKD paper.
 
+All models return **logits**. The original notebook ended every model with a Softmax
+layer and then applied ``nn.CrossEntropyLoss`` (a second softmax), which flattens
+gradients and, for the KD baseline, saturates the KL term. Released checkpoints load
+unchanged (that layer had no parameters); argmax predictions are identical, only reported
+loss values differ.
+
 The malaria CNNs follow Fuhad et al. (2020) and the SPRKD paper, Section 4.1.
 
 * :class:`MalariaTeacherCNN` - 25,546 parameter teacher network.
@@ -28,7 +34,7 @@ class MalariaTeacherCNN(nn.Module):
         Conv2d(4 -> 8, 3x3) -> ReLU
         MaxPool2d(2x2) -> Dropout(0.1)
         Flatten -> Linear(1568 -> 16) -> ReLU -> Dropout(0.2)
-        Linear(16 -> num_classes) -> Softmax(dim=1)
+        Linear(16 -> num_classes)            (logits; no Softmax layer)
 
     Total parameters: ``25,546`` (for ``num_classes=2``).
     """
@@ -47,7 +53,6 @@ class MalariaTeacherCNN(nn.Module):
             nn.ReLU(inplace=False),
             nn.Dropout(0.2),
             nn.Linear(16, num_classes),
-            nn.Softmax(dim=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -65,7 +70,7 @@ class MalariaStudentCNN(nn.Module):
         Conv2d(2 -> 4, 3x3) -> ReLU
         MaxPool2d(2x2) -> Dropout(0.1)
         Flatten -> Linear(784 -> 8) -> ReLU -> Dropout(0.2)
-        Linear(8 -> num_classes) -> Softmax(dim=1)
+        Linear(8 -> num_classes)             (logits; no Softmax layer)
 
     Total parameters: ``6,430`` (for ``num_classes=2``).
     """
@@ -84,7 +89,6 @@ class MalariaStudentCNN(nn.Module):
             nn.ReLU(inplace=False),
             nn.Dropout(0.2),
             nn.Linear(8, num_classes),
-            nn.Softmax(dim=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -112,7 +116,6 @@ def build_legacy_sequential_teacher(num_classes: int = 2) -> nn.Sequential:
         nn.ReLU(),
         nn.Dropout(0.2),
         nn.Linear(16, num_classes),
-        nn.Softmax(dim=1),
     )
 
 
@@ -131,7 +134,6 @@ def build_legacy_sequential_student(num_classes: int = 2) -> nn.Sequential:
         nn.ReLU(),
         nn.Dropout(0.2),
         nn.Linear(8, num_classes),
-        nn.Softmax(dim=1),
     )
 
 
