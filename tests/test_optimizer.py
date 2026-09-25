@@ -336,8 +336,29 @@ def test_default_saddle_threshold_matches_canonical_colab(student_model, cpu_los
     assert sprkd.saddle_criterion.magnitude_threshold == 7.0
 
 
-def test_nhe_adaptive_uses_inverse_eigenvalue_weight(student_model, tiny_batch, cpu_loss):
-    """Verify NHE step magnitude scales as ``1 / |lambda_neg|``."""
+def _unit_step_check(student_model, sprkd, x, y, expected_eta):
+    """NHE moves theta by exactly eta along -sign(g.v) v/||v|| (v = all-ones stub)."""
+    logits = student_model(x)
+    loss = torch.nn.functional.cross_entropy(logits, y)
+    loss.backward()
+    p_before = [p.detach().clone() for p in student_model.parameters()]
+    g_dot_v = sum(float(p.grad.sum()) for p in student_model.parameters())
+    sprkd._negative_hessian_eigenstep(
+        group=sprkd.param_groups[0], model=student_model, data_batch=(x, y)
+    )
+    deltas = [(p_now - p_old).detach() for p_now, p_old in zip(student_model.parameters(), p_before)]
+    total = torch.sqrt(sum(d.pow(2).sum() for d in deltas))
+    assert abs(float(total) - expected_eta) < 1e-5
+    sign = 1.0 if g_dot_v >= 0 else -1.0
+    for d in deltas:
+        # every entry moves by the same amount, against the gradient's projection on v
+        assert torch.all(torch.sign(d) == -sign) or torch.allclose(d, torch.zeros_like(d))
+    assert sprkd.counters()["nhe_taken"] == 1
+    assert sprkd.counters()["nhe_applied"] == 1
+
+
+def test_nhe_adaptive_step_is_min_of_cap_and_eigenvalue(student_model, tiny_batch, cpu_loss):
+    """Adaptive mode: eta = min(nhe_step_size, |lambda_neg|)."""
 
     x, y = tiny_batch
 
@@ -349,42 +370,27 @@ def test_nhe_adaptive_uses_inverse_eigenvalue_weight(student_model, tiny_batch, 
             return self
 
         def eigenvalues(self, top_n=2):
-            # one large positive, one large negative; eigenvectors of ones
             vec_layers = [torch.ones_like(p) for p in student_model.parameters()]
             return [self.lam, -self.lam], [vec_layers, vec_layers]
 
     asr = [torch.zeros_like(p) for p in student_model.parameters()]
     base = torch.optim.SGD(student_model.parameters(), lr=1.0)
-    lam = 4.0
+    lam = 0.03  # below the 0.1 cap, so eta = |lambda|
     sprkd = SPRKD(
         student_model.parameters(),
         base_optimizer=base,
         loss_fn=cpu_loss,
         teacher_saddle_points=asr,
         nhe_step_mode="adaptive",
+        nhe_step_size=0.1,
         max_nhe_steps=10,
+        revert_on_increase=False,
         hessian_factory=_Stub(lam),
     )
-    # Manually invoke NHE to isolate behaviour from the PGD trigger logic
-    logits = student_model(x)
-    loss = cpu_loss(logits, y)
-    loss.backward()
-
-    p_before = [p.detach().clone() for p in student_model.parameters()]
-    grads_before = [p.grad.detach().clone() for p in student_model.parameters()]
-    sprkd._negative_hessian_eigenstep(
-        group=sprkd.param_groups[0],
-        model=student_model,
-        data_batch=(x, y),
-    )
-    expected_weight = 1.0 / lam  # |lambda_neg| = lam
-    for p_now, p_old, g in zip(student_model.parameters(), p_before, grads_before):
-        # eigenvector layers are all-ones, so step = grad * 1 * 1 = grad
-        delta = (p_now - p_old).detach()
-        assert torch.allclose(delta, -expected_weight * g, atol=1e-6)
+    _unit_step_check(student_model, sprkd, x, y, expected_eta=lam)
 
 
-def test_nhe_fixed_uses_constant_weight(student_model, tiny_batch, cpu_loss):
+def test_nhe_fixed_uses_constant_step(student_model, tiny_batch, cpu_loss):
     x, y = tiny_batch
 
     class _Stub:
@@ -405,18 +411,7 @@ def test_nhe_fixed_uses_constant_weight(student_model, tiny_batch, cpu_loss):
         nhe_step_mode="fixed",
         nhe_step_size=0.1,
         max_nhe_steps=10,
+        revert_on_increase=False,
         hessian_factory=_Stub(),
     )
-    logits = student_model(x)
-    loss = cpu_loss(logits, y)
-    loss.backward()
-    p_before = [p.detach().clone() for p in student_model.parameters()]
-    grads_before = [p.grad.detach().clone() for p in student_model.parameters()]
-    sprkd._negative_hessian_eigenstep(
-        group=sprkd.param_groups[0],
-        model=student_model,
-        data_batch=(x, y),
-    )
-    for p_now, p_old, g in zip(student_model.parameters(), p_before, grads_before):
-        delta = (p_now - p_old).detach()
-        assert torch.allclose(delta, -0.1 * g, atol=1e-6)
+    _unit_step_check(student_model, sprkd, x, y, expected_eta=0.1)

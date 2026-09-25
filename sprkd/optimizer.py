@@ -6,7 +6,8 @@ described in Section 3 of the paper:
 1. **Teacher mode** (``is_teacher=True``): runs an inner ``base_optimizer``
    (e.g. Adam) and, every ``saddle_steps`` iterations, evaluates the
    strong-saddle criterion on the model's Hessian. Qualifying snapshots are
-   stored in :attr:`saddle_repository`.
+   stored in :attr:`saddle_repository` together with the loss, the gradient
+   norm and which rule fired.
 
 2. **Control mode** (``is_control=True``): a thin pass-through to
    ``base_optimizer.step()`` for scratch-trained baselines.
@@ -15,46 +16,47 @@ described in Section 3 of the paper:
 
    a. *Iterative ASR approaching* via the exponentially-decayed Euclidean
       Distance Matrix transformation (Section 3.3.1).
-   b. *Negative Hessian Eigensteps (NHE)* once near the ASR (Section 3.3.2).
+   b. *Negative Hessian Eigensteps (NHE)* once near the ASR (Section 3.3.2):
+      a step of size ``eta`` along each negative-curvature eigenvector ``v``
+      in the descent direction ``-sign(g . v) v``, reverted if the batch loss
+      increases.
    c. *Gaussian Perturbed Gradient Descent (PGD)* to escape near-degenerate
-      saddles (Section 3.3.2).
+      saddles (Section 3.3.2), reverted together with the NHE step if the
+      pair fails to reduce the batch loss.
 
-The mathematical conventions follow the paper exactly; deviations are noted
-inline.
+Every Hessian computation preserves the model's train/eval mode and its
+gradients (see :mod:`sprkd.hessian_utils`). Counters for every event are
+available via :meth:`SPRKD.counters`.
+
+Default hyperparameters and their provenance (paper vs. notebook vs. this
+package) are tabulated in ``neurips/04_paper_vs_code_reconciliation.md``.
 """
 
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
 from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
+from sprkd.hessian_utils import batch_loss, default_hessian_factory, hessian_compatible
 from sprkd.saddle import (
     SaddleCriterion,
     SaddlePointRepository,
-    is_strong_saddle_point,
+    which_rules_fire,
 )
 
 
 _HessianFactory = Callable[[], Any]
 
 
-def _default_hessian_factory(
-    model: nn.Module, criterion: nn.Module, data: tuple, use_cuda: bool
-):
-    """Build a PyHessian object, transparently handling MPS / CPU / CUDA.
-
-    PyHessian (upstream) only knows ``cuda`` and ``cpu``. On Apple Silicon
-    the caller must put the model on CPU before calling this factory; see
-    :meth:`SPRKD._with_hessian_compatible_model`.
-    """
-
-    from pyhessian import hessian as PyHessian
-
-    return PyHessian(model=model, criterion=criterion, data=data, cuda=use_cuda)
+def _grad_norm(params: Iterable[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            total += float(p.grad.detach().float().pow(2).sum())
+    return math.sqrt(total)
 
 
 class SPRKD(torch.optim.Optimizer):
@@ -79,40 +81,47 @@ class SPRKD(torch.optim.Optimizer):
         Stride between saddle checks (teacher mode only). ``None`` disables
         saddle checks (student mode).
     saddle_step_limit : int or None, default None
-        If supplied, *stop* tracking saddle points after this many global
-        steps (teacher mode). Matches the ``saddle_step_limit`` argument
-        of the canonical Colab notebook ``EXPERIMENTAL_MODEL_EVALUATIONS``.
+        If supplied, stop tracking saddle points after this many global
+        steps (teacher mode).
     saddle_criterion : SaddleCriterion, optional
-        Detection thresholds. Defaults to ``SaddleCriterion()`` which uses
-        the ``"magnitude"`` rule (``|sum(neg)| >= 7``) - the rule used by
-        the canonical Colab notebook and the released checkpoints.
+        Detection thresholds. Defaults to ``SaddleCriterion()`` (``"magnitude"``
+        rule, ``|sum(neg)| >= 7``, no gradient gate).
+    saddle_top_k : int or None, default None
+        Keep only the ``top_k`` lowest-loss snapshots in the repository.
     epsilon : float, default 1e-3
         Maximum allowed Euclidean distance between student and ASR before
-        the iterative-approach phase terminates (matches the
-        ``epsilon = 10e-3`` default in the canonical Colab).
-    pgd_grad_threshold : float, default 0.01
-        Gradient L2-norm threshold below which the student is flagged as
-        stagnating (paper's ``j``; canonical Colab default).
-    pgd_delta : float, default 5.0
-        Average ASR distance above which PGD perturbations are still allowed.
+        the iterative-approach phase terminates (the paper text says 0.1; the
+        notebook and released checkpoints used 1e-3).
+    pgd_grad_threshold : float, default 0.02
+        Gradient L2-norm threshold below which a parameter tensor is flagged
+        as stagnating (paper's ``j``; the notebook's final run used 0.02).
+    pgd_delta : float, default 0.25
+        Mean ``| ||p|| - ||T|| |`` gap to the ASR above which perturbations
+        are allowed (notebook's final run: 0.25; the previous package default
+        of 5.0 was effectively unreachable).
     pgd_epoch_limit : int, default 100
-        Disable PGD perturbations after this many epochs.
+        Disable perturbations after this many epochs.
     pgd_perturb_variance : float, default 0.1
-        Variance of the Gaussian perturbation; the paper specifies
-        ``xi ~ N(0, 0.1)`` (Section 3.3.2). The perturbation magnitude is
-        ``sqrt(pgd_perturb_variance) * randn_like(param)`` to match the
-        canonical Colab ``param + sqrt(0.1) * randn_like(param)``.
+        Variance of the Gaussian perturbation ``xi ~ N(0, 0.1)`` (paper Sec.
+        3.3.2). Set to 0 to disable PGD.
     max_nhe_steps : int, default 50
-        Cap on Negative Hessian Eigensteps per training run.
+        Cap on NHE attempts per training run. Set to 0 to disable NHE.
     cooldown_steps : int, default 20
-        Minimum gap between successive perturbations.
+        Minimum gap between successive perturbation events.
     nhe_step_mode : {"adaptive", "fixed"}, default ``"adaptive"``
-        - ``"adaptive"``: step size is ``1 / |lambda_neg|`` (canonical Colab).
-        - ``"fixed"``: step size is ``nhe_step_size`` (legacy notebook).
+        ``"fixed"``: step length ``eta = nhe_step_size`` along each negative
+        eigenvector. ``"adaptive"``: ``eta = min(nhe_step_size, |lambda|)``,
+        the Nesterov-Polyak choice ``|lambda| / rho`` with the Hessian
+        Lipschitz constant ``rho`` taken as 1 and capped by ``nhe_step_size``.
     nhe_step_size : float, default 0.1
-        Used only when ``nhe_step_mode == "fixed"``.
+        Step length (fixed mode) or cap (adaptive mode).
     n_top_eigs : int, default 4
         Number of leading eigenvalues to compute when checking saddles.
+    n_nhe_eigs : int, default 2
+        Number of leading eigenpairs to compute for NHE; every negative one
+        is used.
+    revert_on_increase : bool, default True
+        Undo an NHE + PGD event if the batch loss did not decrease.
     hessian_factory : callable, optional
         Override the PyHessian builder; primarily useful for testing.
     """
@@ -129,9 +138,10 @@ class SPRKD(torch.optim.Optimizer):
         saddle_steps: Optional[int] = 50,
         saddle_step_limit: Optional[int] = None,
         saddle_criterion: Optional[SaddleCriterion] = None,
+        saddle_top_k: Optional[int] = None,
         epsilon: float = 1e-3,
-        pgd_grad_threshold: float = 0.01,
-        pgd_delta: float = 5.0,
+        pgd_grad_threshold: float = 0.02,
+        pgd_delta: float = 0.25,
         pgd_epoch_limit: int = 100,
         pgd_perturb_variance: float = 0.1,
         max_nhe_steps: int = 50,
@@ -139,6 +149,8 @@ class SPRKD(torch.optim.Optimizer):
         nhe_step_mode: str = "adaptive",
         nhe_step_size: float = 0.1,
         n_top_eigs: int = 4,
+        n_nhe_eigs: int = 2,
+        revert_on_increase: bool = True,
         hessian_factory: Optional[_HessianFactory] = None,
     ):
         if is_teacher and is_control:
@@ -164,6 +176,8 @@ class SPRKD(torch.optim.Optimizer):
             raise ValueError(
                 f"pgd_perturb_variance must be >= 0, got {pgd_perturb_variance}"
             )
+        if nhe_step_size <= 0:
+            raise ValueError(f"nhe_step_size must be > 0, got {nhe_step_size}")
 
         defaults: dict = dict(
             is_teacher=is_teacher,
@@ -180,26 +194,36 @@ class SPRKD(torch.optim.Optimizer):
             nhe_step_mode=nhe_step_mode,
             nhe_step_size=nhe_step_size,
             n_top_eigs=n_top_eigs,
+            n_nhe_eigs=n_nhe_eigs,
+            revert_on_increase=revert_on_increase,
         )
         super().__init__(params, defaults)
 
         self.base_optimizer = base_optimizer
         self.loss_fn = loss_fn
         self.saddle_criterion = saddle_criterion or SaddleCriterion()
-        self._hessian_factory = hessian_factory or _default_hessian_factory
+        self._hessian_factory = hessian_factory or default_hessian_factory
 
         self.teacher_saddle_points: List[torch.Tensor] = (
             list(teacher_saddle_points) if teacher_saddle_points is not None else []
         )
 
         # Persistent state (per-optimizer, not per-parameter).
-        self.saddle_repository = SaddlePointRepository(teacher_index=0)
+        self.saddle_repository = SaddlePointRepository(teacher_index=0, top_k=saddle_top_k)
         self._step_count: int = 0
         self._allow_targeting: dict[int, bool] = {}
         self._cooldown: int = cooldown_steps
-        self._n_nhe_taken: int = 0
-        self._param_history_pgd: dict[int, torch.Tensor] = {}
         self._stored_loss: float = 0.0
+        self._tm_finished_step: Optional[int] = None
+        # Event counters.
+        self._n_nhe_taken: int = 0          # NHE attempts (Hessian computed)
+        self._n_nhe_applied: int = 0        # attempts that changed parameters
+        self._n_nhe_no_negative: int = 0    # attempts with no negative eigenvalue
+        self._n_nhe_reverted: int = 0       # NHE-only reverts (loss increased)
+        self._n_pgd_fired: int = 0          # Gaussian perturbations applied and kept
+        self._n_pgd_reverted: int = 0       # NHE + PGD events undone
+        self._n_pgd_considered: int = 0     # trigger conditions met
+        self._nhe_eigenvalues: List[float] = []
 
     # ------------------------------------------------------------------ utils
     @property
@@ -212,6 +236,23 @@ class SPRKD(torch.optim.Optimizer):
         if not self._allow_targeting:
             return False
         return not any(self._allow_targeting.values())
+
+    def counters(self) -> dict:
+        """Event counters for logging and ablations."""
+
+        return {
+            "step_count": self._step_count,
+            "tm_finished_step": self._tm_finished_step,
+            "nhe_taken": self._n_nhe_taken,
+            "nhe_applied": self._n_nhe_applied,
+            "nhe_no_negative": self._n_nhe_no_negative,
+            "nhe_reverted": self._n_nhe_reverted,
+            "pgd_considered": self._n_pgd_considered,
+            "pgd_fired": self._n_pgd_fired,
+            "pgd_reverted": self._n_pgd_reverted,
+            "saddles_checked": self.saddle_repository.n_checked,
+            "saddles_recorded": len(self.saddle_repository),
+        }
 
     def _all_params(self):
         for group in self.param_groups:
@@ -254,6 +295,7 @@ class SPRKD(torch.optim.Optimizer):
                 continue
 
             if group["is_teacher"]:
+                grad_norm = _grad_norm(group["params"])
                 self.base_optimizer.step()
                 limit = group["saddle_step_limit"]
                 if (
@@ -266,6 +308,7 @@ class SPRKD(torch.optim.Optimizer):
                         model=model,
                         data_batch=data_batch,
                         loss_value=float(current_loss.detach().cpu()),
+                        grad_norm=grad_norm,
                     )
                 continue
 
@@ -277,7 +320,11 @@ class SPRKD(torch.optim.Optimizer):
 
             if any(self._allow_targeting.values()):
                 self._apply_transformation_matrix(group)
+                if not any(self._allow_targeting.values()):
+                    self._tm_finished_step = self._step_count
             else:
+                if self._tm_finished_step is None:
+                    self._tm_finished_step = self._step_count
                 self.base_optimizer.step()
                 self._maybe_apply_perturbation(
                     group=group,
@@ -293,32 +340,10 @@ class SPRKD(torch.optim.Optimizer):
         return loss
 
     # ----------------------------------------------------- teacher-mode logic
-    @contextmanager
     def _hessian_compat_model(self, model: nn.Module, data_batch: Optional[tuple]):
-        """Yield a (model, data_batch, use_cuda) triple safe for PyHessian.
+        """Backward-compatible alias for :func:`sprkd.hessian_utils.hessian_compatible`."""
 
-        PyHessian only supports cuda or cpu; on MPS we transparently move
-        model + batch to CPU for the duration of the call and restore the
-        original device afterwards.
-        """
-
-        original = next(model.parameters()).device
-        moved = False
-        try:
-            if original.type == "mps":
-                model.to("cpu")
-                moved = True
-                if data_batch is not None and isinstance(data_batch, (tuple, list)):
-                    data_batch = tuple(
-                        d.to("cpu") if hasattr(d, "to") else d for d in data_batch
-                    )
-                use_cuda = False
-            else:
-                use_cuda = original.type == "cuda"
-            yield model, data_batch, use_cuda
-        finally:
-            if moved:
-                model.to(original)
+        return hessian_compatible(model, data_batch)
 
     def _maybe_record_saddle(
         self,
@@ -327,6 +352,7 @@ class SPRKD(torch.optim.Optimizer):
         model: nn.Module,
         data_batch: Optional[tuple],
         loss_value: float,
+        grad_norm: Optional[float] = None,
     ) -> None:
         if data_batch is None:
             try:
@@ -337,12 +363,22 @@ class SPRKD(torch.optim.Optimizer):
                     "model with `.dls.train` (fastai-style)."
                 ) from e
 
-        with self._hessian_compat_model(model, data_batch) as (m, batch, use_cuda):
+        with hessian_compatible(model, data_batch) as (m, batch, use_cuda):
             hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
             eigenvalues, _ = hess.eigenvalues(top_n=group["n_top_eigs"])
 
-        if is_strong_saddle_point(eigenvalues, criterion=self.saddle_criterion):
-            self.saddle_repository.append(group["params"], loss=loss_value)
+        self.saddle_repository.n_checked += 1
+        outcome = which_rules_fire(eigenvalues, self.saddle_criterion, grad_norm)
+        outcome["eigenvalues"] = [float(e) for e in eigenvalues]
+        outcome["rule"] = self.saddle_criterion.rule
+        if outcome["fired"]:
+            self.saddle_repository.append(
+                group["params"],
+                loss=loss_value,
+                grad_norm=grad_norm,
+                step=self._step_count,
+                rule=outcome,
+            )
 
     # ----------------------------------------------------- student-mode logic
     def _student_average_distance(self, group: dict) -> torch.Tensor:
@@ -367,6 +403,8 @@ class SPRKD(torch.optim.Optimizer):
                 self._allow_targeting[i] = False
                 continue
             tm = torch.div(sp, p.where(p != 0, torch.tensor(1e-8, device=p.device)))
+            # Decay as implemented in the notebook that produced the released
+            # checkpoints: l = 1 - 2^(-t/10) / 2 (the paper text omits the /2).
             weight = -2.0 ** (-self._step_count / 10.0) / 2.0 + 1.0
             p.data = p.data.mul(weight * tm)
 
@@ -387,17 +425,20 @@ class SPRKD(torch.optim.Optimizer):
         avg_distance: torch.Tensor,
         current_loss: float,
     ) -> None:
-        """NHE + Gaussian PGD perturbation per the canonical Colab notebook.
+        """NHE + Gaussian PGD event with verification and revert (paper Sec. 3.3.2).
 
-        Mirrors ``perturbedGD()`` from
-        ``SPRKD_SADDLE_POINT_RECRUITMENT_FOR_KNOWLEDGE_DISTILLATION_ADITYA_DEWAN_2023.ipynb``:
+        Trigger (per the canonical notebook): some parameter tensor has
+        ``||grad|| < pgd_grad_threshold``, the mean norm gap to the ASR exceeds
+        ``pgd_delta``, the epoch is below ``pgd_epoch_limit``, the cooldown has
+        elapsed, the ASR has been reached, and the loss has decreased by at
+        least 0.002 since the previous event. Then:
 
-        1. trigger only if ``|grad| < grad_threshold``,
-           ``avg_distance > pgd_delta``, ``epoch < pgd_epoch_limit``,
-           cooldown elapsed, and ASR has been reached;
-        2. NHE step (if budget remains) using
-           ``weight = 1 / |lambda_neg|`` (or fixed in legacy mode);
-        3. Gaussian perturbation with variance 0.1 (paper Sec. 3.3.2).
+        1. snapshot all parameters;
+        2. NHE step (if budget remains): ``theta -= eta * sign(g . v) * v`` for
+           every negative eigenpair, reverted on its own if the batch loss rose;
+        3. Gaussian perturbation of the flagged tensor, ``sqrt(variance) * N(0, 1)``;
+        4. if the batch loss after (2)+(3) is not below the pre-event loss, revert
+           everything to the snapshot.
         """
 
         if self._cooldown > 0:
@@ -408,6 +449,11 @@ class SPRKD(torch.optim.Optimizer):
         steps_per_epoch = max(1, getattr(model, "_steps_per_epoch", 1))
         if self._step_count / steps_per_epoch >= group["pgd_epoch_limit"]:
             return
+        if data_batch is None:
+            try:
+                data_batch = next(iter(model.dls.train))
+            except AttributeError:
+                return
 
         for i, p in enumerate(group["params"]):
             if p.grad is None:
@@ -420,13 +466,25 @@ class SPRKD(torch.optim.Optimizer):
             if self._stored_loss != 0.0 and self._stored_loss - current_loss < 0.002:
                 continue
 
-            self._param_history_pgd[i] = p.detach().clone()
+            self._n_pgd_considered += 1
+            snapshot = [q.detach().clone() for q in group["params"]]
+            pre_loss = batch_loss(model, self.loss_fn, data_batch)
 
             self._negative_hessian_eigenstep(group=group, model=model, data_batch=data_batch)
 
             std = math.sqrt(abs(group["pgd_perturb_variance"]))
-            with torch.no_grad():
-                p.data = p.data + std * torch.randn_like(p.data)
+            if std > 0:
+                with torch.no_grad():
+                    p.data = p.data + std * torch.randn_like(p.data)
+
+            post_loss = batch_loss(model, self.loss_fn, data_batch)
+            if group["revert_on_increase"] and post_loss >= pre_loss:
+                with torch.no_grad():
+                    for q, s in zip(group["params"], snapshot):
+                        q.data.copy_(s)
+                self._n_pgd_reverted += 1
+            else:
+                self._n_pgd_fired += 1
 
             self._stored_loss = current_loss
             self._cooldown = group["cooldown_steps"]
@@ -438,59 +496,70 @@ class SPRKD(torch.optim.Optimizer):
         group: dict,
         model: nn.Module,
         data_batch: Optional[tuple],
-    ) -> None:
-        """Take a single NHE step along the largest-magnitude negative direction.
+    ) -> bool:
+        """Negative-curvature descent step along every negative top eigenvector.
 
-        Mirrors ``negativeHessianEigensteps()`` in the canonical notebook:
-
-        .. code-block:: python
-
-            weight = 1 / largest_negative_eigenvalue           # adaptive
-            param.data -= weight * grad * v * v                # broadcast
-
-        and is bounded by ``max_nhe_steps`` to match the upper bound used
-        by the released SPRKD checkpoints.
+        For each eigenpair ``(lambda, v)`` with ``lambda < 0`` (``v`` a unit
+        vector over all parameters), move ``theta <- theta - eta * sign(g . v) * v``
+        so that the first-order term decreases; second-order descent follows from
+        ``lambda < 0`` (Nesterov & Polyak 2006; Carmon et al. 2018). The step is
+        reverted if the batch loss increases. Returns ``True`` if parameters were
+        changed and kept.
         """
 
         if self._n_nhe_taken >= group["max_nhe_steps"]:
-            return
+            return False
 
         if data_batch is None:
             try:
                 data_batch = next(iter(model.dls.train))
             except AttributeError:
-                return
-
-        with self._hessian_compat_model(model, data_batch) as (m, batch, use_cuda):
-            hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
-            top_eigs, top_vecs = hess.eigenvalues(top_n=2)
-
-        if not top_eigs:
-            return
-        ev_index = top_eigs.index(min(top_eigs))
-        lambda_neg = float(top_eigs[ev_index])
-        if lambda_neg >= 0:
-            return  # only negative-curvature directions
-
-        v_layers = top_vecs[ev_index]
-        if group["nhe_step_mode"] == "adaptive":
-            weight = 1.0 / abs(lambda_neg)
-        else:
-            weight = float(group["nhe_step_size"])
-
-        with torch.no_grad():
-            for p, v in zip(group["params"], v_layers):
-                if p.grad is None:
-                    continue
-                v_t = v if isinstance(v, torch.Tensor) else torch.as_tensor(v)
-                v_t = v_t.to(p.device, dtype=p.dtype)
-                # paper formula: theta <- theta - weight * grad * (v * v)
-                # element-wise; canonical Colab uses the same.
-                grad = p.grad.detach()
-                step = grad.mul(v_t).mul(v_t)
-                p.data = p.data - weight * step
+                return False
 
         self._n_nhe_taken += 1
+        with hessian_compatible(model, data_batch) as (m, batch, use_cuda):
+            hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
+            top_eigs, top_vecs = hess.eigenvalues(top_n=group["n_nhe_eigs"])
+
+        negatives = [(float(ev), vec) for ev, vec in zip(top_eigs, top_vecs) if float(ev) < 0]
+        if not negatives:
+            self._n_nhe_no_negative += 1
+            return False
+
+        params = group["params"]
+        snapshot = [q.detach().clone() for q in params]
+        pre_loss = batch_loss(model, self.loss_fn, data_batch)
+
+        with torch.no_grad():
+            for lam, v_layers in negatives:
+                vecs = [
+                    (v if isinstance(v, torch.Tensor) else torch.as_tensor(v)).to(p.device, dtype=p.dtype)
+                    for p, v in zip(params, v_layers)
+                ]
+                norm = math.sqrt(sum(float(v.float().pow(2).sum()) for v in vecs)) or 1.0
+                gv = sum(
+                    float((p.grad.detach().float() * v.float()).sum())
+                    for p, v in zip(params, vecs)
+                    if p.grad is not None
+                )
+                sign = 1.0 if gv >= 0 else -1.0
+                if group["nhe_step_mode"] == "adaptive":
+                    eta = min(float(group["nhe_step_size"]), abs(lam))
+                else:
+                    eta = float(group["nhe_step_size"])
+                for p, v in zip(params, vecs):
+                    p.data.add_(v, alpha=-eta * sign / norm)
+                self._nhe_eigenvalues.append(lam)
+
+        post_loss = batch_loss(model, self.loss_fn, data_batch)
+        if group["revert_on_increase"] and post_loss > pre_loss:
+            with torch.no_grad():
+                for q, s in zip(params, snapshot):
+                    q.data.copy_(s)
+            self._n_nhe_reverted += 1
+            return False
+        self._n_nhe_applied += 1
+        return True
 
     # ----------------------------------------------------- standard plumbing
     def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
@@ -506,5 +575,6 @@ class SPRKD(torch.optim.Optimizer):
             "n_nhe_taken": self._n_nhe_taken,
             "stored_loss": self._stored_loss,
             "n_saddles_recorded": len(self.saddle_repository),
+            "counters": self.counters(),
         }
         return sd

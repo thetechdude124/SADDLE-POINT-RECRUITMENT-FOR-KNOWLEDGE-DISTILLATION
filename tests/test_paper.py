@@ -158,8 +158,9 @@ def test_pgd_defaults_match_paper_section_3_3_2(student_model, cpu_loss):
     )
     g = sprkd.param_groups[0]
     assert g["pgd_perturb_variance"] == PAPER_HYPERPARAMS["pgd_variance"]
-    # canonical Colab uses 0.01; paper stagnation threshold j=0.02
-    assert g["pgd_grad_threshold"] == 0.01
+    # paper stagnation threshold j = 0.02 (also the notebook's final run); the
+    # earlier package default of 0.01 came from an intermediate Colab cell
+    assert g["pgd_grad_threshold"] == PAPER_HYPERPARAMS["pgd_grad_threshold_paper"]
 
 
 # ---------------------------------------------------------------------------
