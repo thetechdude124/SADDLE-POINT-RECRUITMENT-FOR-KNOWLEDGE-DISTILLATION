@@ -23,8 +23,8 @@ paper. The full PDF is at [`docs/sprkd_paper.pdf`](docs/sprkd_paper.pdf).
 On revisiting the code for a follow-up study we found several issues that affect the
 results reported in the arXiv v1 preprint. They are fixed on the `main` branch as of
 version 0.2.0; the regression tests are in `tests/test_fixes.py` and a line-by-line
-comparison of paper, notebook and package values is in the follow-up repository's
-`neurips/04_paper_vs_code_reconciliation.md`.
+comparison of paper, notebook and package values is in
+[`docs/RECONCILIATION.md`](docs/RECONCILIATION.md).
 
 - **Response KD baseline.** The v1 baseline was trained on a KL term only (no label
   term, temperature 1) applied to outputs that already passed through a Softmax layer
