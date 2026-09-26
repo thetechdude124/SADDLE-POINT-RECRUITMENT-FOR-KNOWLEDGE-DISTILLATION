@@ -49,6 +49,7 @@ def parse():
     p.add_argument("--string-iters", type=int, default=300)
     p.add_argument("--climb-iters", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.02)
+    p.add_argument("--max-step", type=float, default=0.5, help="clip the per-node update norm (string and climbing phases)")
     p.add_argument("--refine-max-steps", type=int, default=60)
     p.add_argument("--refine-grad-tol", type=float, default=1e-2)
     p.add_argument("--student-epochs", type=int, default=30)
@@ -147,10 +148,16 @@ def string_method(fl, a, b, args, log):
         losses, grads = [], []
         for v in nodes:
             l, g = fl.loss_and_grad(v); losses.append(l); grads.append(g)
+        if any(math.isnan(l) for l in losses):
+            raise RuntimeError(f"string method diverged at iteration {it}: nan loss")
         for i in range(1, K + 1):
             tau = upwind_tangent(nodes, losses, i)
             g_perp = grads[i] - torch.dot(grads[i], tau) * tau
-            nodes[i] = nodes[i] - args.lr * g_perp
+            step = args.lr * g_perp
+            sn = float(step.norm())
+            if sn > args.max_step:
+                step = step * (args.max_step / sn)
+            nodes[i] = nodes[i] - step
         if it % 10 == 9:
             nodes = redistribute(nodes)
         if it % 25 == 0 or it == args.string_iters - 1:
@@ -164,7 +171,11 @@ def string_method(fl, a, b, args, log):
         l, g = fl.loss_and_grad(nodes[ci])
         tau = upwind_tangent(nodes, losses, ci)
         force = -(g - 2.0 * torch.dot(g, tau) * tau)          # -g_perp + g_par
-        nodes[ci] = nodes[ci] + args.lr * force
+        step = args.lr * force
+        sn = float(step.norm())
+        if sn > args.max_step:
+            step = step * (args.max_step / sn)
+        nodes[ci] = nodes[ci] + step
         if it % 50 == 0 or it == args.climb_iters - 1:
             gn_perp = float((g - torch.dot(g, tau) * tau).norm())
             hist.append({"phase": "climb", "iter": it, "ci": ci, "loss": l, "grad_norm": float(g.norm()), "grad_perp_norm": gn_perp})
