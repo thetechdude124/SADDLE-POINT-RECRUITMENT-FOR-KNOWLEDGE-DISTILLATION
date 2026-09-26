@@ -3,6 +3,28 @@
 All notable changes to the SPRKD package are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-09-25 (saddle detection)
+
+### Added
+- `sprkd.hessian_utils.HessianOperator` and `extreme_eigenpairs`: matrix-free
+  Hessian-vector products and direct estimation of the largest and most negative
+  eigenpairs (Lanczos via scipy, power-iteration fallback).
+- `SaddleCriterion(rule="extreme")`, now the default: a point qualifies when
+  `lambda_max > 0` and `lambda_min < -tau` (`tau` absolute or `tau_rel * lambda_max`).
+  The 0.1/0.2 top-k-by-magnitude rules remain available.
+- `sprkd.saddle.refine_to_stationary`: Newton/MINRES refinement of a candidate snapshot to
+  a stationary point of the probe-batch loss, with a gradient-norm-descent fallback.
+- `SPRKD(saddle_refine=True, ...)`: candidates are refined on a copy of the model and
+  recorded only when `grad_norm <= refine_grad_tol` and `lambda_min < -tau` afterwards;
+  fixed or trajectory-quantile gradient tolerance; full before/after record per snapshot.
+- `SPRKD(nhe_direction="lambda_min")` (default): the negative eigenstep follows the most
+  negative eigenvector directly.
+- `tests/test_saddle_detection.py`.
+
+### Changed
+- Default saddle rule is `extreme`; use `SaddleCriterion(rule="magnitude")` to reproduce
+  0.2 runs.
+
 ## [0.2.0] - 2026-09-25 (corrections)
 
 ### Fixed
