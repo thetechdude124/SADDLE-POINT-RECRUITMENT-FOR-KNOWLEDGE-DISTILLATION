@@ -40,10 +40,13 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from sprkd.hessian_utils import batch_loss, default_hessian_factory, hessian_compatible
+import copy
+
+from sprkd.hessian_utils import batch_loss, default_hessian_factory, extreme_eigenpairs, hessian_compatible
 from sprkd.saddle import (
     SaddleCriterion,
     SaddlePointRepository,
+    refine_to_stationary,
     which_rules_fire,
 )
 
@@ -84,8 +87,9 @@ class SPRKD(torch.optim.Optimizer):
         If supplied, stop tracking saddle points after this many global
         steps (teacher mode).
     saddle_criterion : SaddleCriterion, optional
-        Detection thresholds. Defaults to ``SaddleCriterion()`` (``"magnitude"``
-        rule, ``|sum(neg)| >= 7``, no gradient gate).
+        Detection thresholds. Defaults to ``SaddleCriterion()`` (``"extreme"``
+        rule: ``lambda_max > 0`` and ``lambda_min < -0.05 lambda_max``, no
+        gradient gate). Use ``rule="magnitude"`` to reproduce version 0.1/0.2.
     saddle_top_k : int or None, default None
         Keep only the ``top_k`` lowest-loss snapshots in the repository.
     epsilon : float, default 1e-3
@@ -118,8 +122,22 @@ class SPRKD(torch.optim.Optimizer):
     n_top_eigs : int, default 4
         Number of leading eigenvalues to compute when checking saddles.
     n_nhe_eigs : int, default 2
-        Number of leading eigenpairs to compute for NHE; every negative one
-        is used.
+        Number of leading eigenpairs to compute for NHE when
+        ``nhe_direction="topk"``; every negative one is used.
+    nhe_direction : {"lambda_min", "topk"}, default ``"lambda_min"``
+        ``"lambda_min"`` computes the most negative eigenpair directly and steps
+        along it whenever ``lambda_min < -tau``; ``"topk"`` reproduces the 0.2
+        behaviour (negative eigenvalues among the top-k by magnitude).
+    saddle_refine : bool, default False
+        Teacher mode: refine each candidate to a stationary point of the probe
+        batch loss (:func:`sprkd.saddle.refine_to_stationary`) on a copy of the
+        model, re-run the eigen check, and record it only if
+        ``grad_norm <= refine_grad_tol`` and ``lambda_min < -tau``.
+    refine_grad_tol_mode : {"fixed", "quantile"}
+        ``"fixed"`` uses ``refine_grad_tol`` (what the paper's definition of a
+        saddle point, grad = 0, requires); ``"quantile"`` uses the
+        ``refine_grad_tol_quantile`` quantile of the gradient norms seen so far
+        on the trajectory (a relative notion, for exploration only).
     revert_on_increase : bool, default True
         Undo an NHE + PGD event if the batch loss did not decrease.
     hessian_factory : callable, optional
@@ -150,7 +168,15 @@ class SPRKD(torch.optim.Optimizer):
         nhe_step_size: float = 0.1,
         n_top_eigs: int = 4,
         n_nhe_eigs: int = 2,
+        nhe_direction: str = "lambda_min",
         revert_on_increase: bool = True,
+        saddle_refine: bool = False,
+        refine_max_steps: int = 30,
+        refine_grad_tol: float = 1e-2,
+        refine_grad_tol_mode: str = "fixed",
+        refine_grad_tol_quantile: float = 0.1,
+        refine_lr: float = 1e-2,
+        refine_loss_tol: float = 0.05,
         hessian_factory: Optional[_HessianFactory] = None,
     ):
         if is_teacher and is_control:
@@ -178,6 +204,10 @@ class SPRKD(torch.optim.Optimizer):
             )
         if nhe_step_size <= 0:
             raise ValueError(f"nhe_step_size must be > 0, got {nhe_step_size}")
+        if nhe_direction not in {"lambda_min", "topk"}:
+            raise ValueError(f"nhe_direction must be 'lambda_min' or 'topk', got {nhe_direction!r}")
+        if refine_grad_tol_mode not in {"fixed", "quantile"}:
+            raise ValueError(f"refine_grad_tol_mode must be 'fixed' or 'quantile', got {refine_grad_tol_mode!r}")
 
         defaults: dict = dict(
             is_teacher=is_teacher,
@@ -195,7 +225,15 @@ class SPRKD(torch.optim.Optimizer):
             nhe_step_size=nhe_step_size,
             n_top_eigs=n_top_eigs,
             n_nhe_eigs=n_nhe_eigs,
+            nhe_direction=nhe_direction,
             revert_on_increase=revert_on_increase,
+            saddle_refine=saddle_refine,
+            refine_max_steps=refine_max_steps,
+            refine_grad_tol=refine_grad_tol,
+            refine_grad_tol_mode=refine_grad_tol_mode,
+            refine_grad_tol_quantile=refine_grad_tol_quantile,
+            refine_lr=refine_lr,
+            refine_loss_tol=refine_loss_tol,
         )
         super().__init__(params, defaults)
 
@@ -225,6 +263,10 @@ class SPRKD(torch.optim.Optimizer):
         self._n_pgd_considered: int = 0     # trigger conditions met
         self._nhe_eigenvalues: List[float] = []
         self.events: List[dict] = []        # one record per NHE / PGD event (for inspection)
+        self._trajectory_grad_norms: List[float] = []   # for the quantile grad_tol mode
+        self._n_candidates: int = 0         # checks whose eigen rule fired before refinement
+        self._n_refined: int = 0            # candidates that went through refinement
+        self._n_refine_rejected: int = 0    # refined candidates that failed the verification
 
     # ------------------------------------------------------------------ utils
     @property
@@ -252,6 +294,9 @@ class SPRKD(torch.optim.Optimizer):
             "pgd_fired": self._n_pgd_fired,
             "pgd_reverted": self._n_pgd_reverted,
             "saddles_checked": self.saddle_repository.n_checked,
+            "saddle_candidates": self._n_candidates,
+            "saddles_refined": self._n_refined,
+            "saddles_refine_rejected": self._n_refine_rejected,
             "saddles_recorded": len(self.saddle_repository),
         }
 
@@ -297,6 +342,7 @@ class SPRKD(torch.optim.Optimizer):
 
             if group["is_teacher"]:
                 grad_norm = _grad_norm(group["params"])
+                self._trajectory_grad_norms.append(grad_norm)
                 self.base_optimizer.step()
                 limit = group["saddle_step_limit"]
                 if (
@@ -364,22 +410,83 @@ class SPRKD(torch.optim.Optimizer):
                     "model with `.dls.train` (fastai-style)."
                 ) from e
 
+        self.saddle_repository.n_checked += 1
+        outcome = self._eigen_check(group, model, data_batch, grad_norm)
+        outcome["rule"] = self.saddle_criterion.rule
+        if not outcome["fired"]:
+            return
+        self._n_candidates += 1
+        params_to_store = group["params"]
+        if group["saddle_refine"]:
+            outcome = self._refine_candidate(group, model, data_batch, outcome, loss_value)
+            if not outcome["verified"]:
+                self._n_refine_rejected += 1
+                return
+            params_to_store = outcome.pop("_refined_params")
+            loss_value = outcome["loss_after"]
+            grad_norm = outcome["grad_norm_after"]
+        self.saddle_repository.append(
+            params_to_store,
+            loss=loss_value,
+            grad_norm=grad_norm,
+            step=self._step_count,
+            rule=outcome,
+        )
+
+    def _eigen_check(self, group: dict, model: nn.Module, data_batch: tuple, grad_norm: Optional[float]) -> dict:
+        """Evaluate the saddle criterion at the model's current parameters."""
+
+        if self.saddle_criterion.rule == "extreme":
+            ext = extreme_eigenpairs(model, self.loss_fn, data_batch)
+            outcome = which_rules_fire(None, self.saddle_criterion, grad_norm,
+                                       lambda_max=ext["lambda_max"], lambda_min=ext["lambda_min"])
+            outcome["n_hvp"] = ext["n_hvp"]
+            outcome["eigen_method"] = ext["method"]
+            return outcome
         with hessian_compatible(model, data_batch) as (m, batch, use_cuda):
             hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
             eigenvalues, _ = hess.eigenvalues(top_n=group["n_top_eigs"])
-
-        self.saddle_repository.n_checked += 1
         outcome = which_rules_fire(eigenvalues, self.saddle_criterion, grad_norm)
         outcome["eigenvalues"] = [float(e) for e in eigenvalues]
-        outcome["rule"] = self.saddle_criterion.rule
-        if outcome["fired"]:
-            self.saddle_repository.append(
-                group["params"],
-                loss=loss_value,
-                grad_norm=grad_norm,
-                step=self._step_count,
-                rule=outcome,
-            )
+        return outcome
+
+    def _current_grad_tol(self, group: dict) -> float:
+        if group["refine_grad_tol_mode"] == "quantile" and len(self._trajectory_grad_norms) >= 5:
+            return float(torch.tensor(self._trajectory_grad_norms).quantile(group["refine_grad_tol_quantile"]))
+        return float(group["refine_grad_tol"])
+
+    def _refine_candidate(self, group: dict, model: nn.Module, data_batch: tuple, candidate: dict, loss_value: float) -> dict:
+        """Refine a candidate to a stationary point on a copy of the model and re-verify it.
+
+        A verified saddle has ``grad_norm <= grad_tol`` and ``lambda_min < -tau`` after
+        refinement. The record keeps loss and gradient norm before/after, both extreme
+        eigenvalues, the number of refinement steps and HVPs, wall-clock, and whether the
+        loss drifted by more than ``refine_loss_tol``.
+        """
+
+        self._n_refined += 1
+        grad_tol = self._current_grad_tol(group)
+        work = copy.deepcopy(model)
+        rec = refine_to_stationary(work, self.loss_fn, data_batch, max_steps=group["refine_max_steps"],
+                                   grad_tol=grad_tol, lr=group["refine_lr"])
+        ext = extreme_eigenpairs(work, self.loss_fn, data_batch)
+        tau = self.saddle_criterion.tau_for(ext["lambda_max"])
+        verified = bool(rec["grad_norm_after"] <= grad_tol and ext["lambda_min"] < -tau)
+        out = dict(candidate)
+        out.update({
+            "refined": True, "grad_tol": grad_tol, "grad_tol_mode": group["refine_grad_tol_mode"],
+            "candidate_loss": loss_value, "loss_before": rec["loss_before"], "loss_after": rec["loss_after"],
+            "loss_drift": rec["loss_after"] - rec["loss_before"],
+            "loss_within_tol": abs(rec["loss_after"] - rec["loss_before"]) <= group["refine_loss_tol"],
+            "grad_norm_before": rec["grad_norm_before"], "grad_norm_after": rec["grad_norm_after"],
+            "lambda_max_before": candidate.get("lambda_max"), "lambda_min_before": candidate.get("lambda_min"),
+            "lambda_max_after": ext["lambda_max"], "lambda_min_after": ext["lambda_min"], "tau_after": tau,
+            "refine_steps": rec["steps"], "refine_n_hvp": rec["n_hvp"] + ext["n_hvp"], "refine_converged": rec["converged"],
+            "refine_wall_clock_s": rec["wall_clock_s"], "verified": verified,
+            "_refined_params": [p.detach().clone() for p in work.parameters()],
+        })
+        del work
+        return out
 
     # ----------------------------------------------------- student-mode logic
     def _student_average_distance(self, group: dict) -> torch.Tensor:
@@ -524,11 +631,16 @@ class SPRKD(torch.optim.Optimizer):
                 return False
 
         self._n_nhe_taken += 1
-        with hessian_compatible(model, data_batch) as (m, batch, use_cuda):
-            hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
-            top_eigs, top_vecs = hess.eigenvalues(top_n=group["n_nhe_eigs"])
-
-        negatives = [(float(ev), vec) for ev, vec in zip(top_eigs, top_vecs) if float(ev) < 0]
+        if group["nhe_direction"] == "lambda_min":
+            ext = extreme_eigenpairs(model, self.loss_fn, data_batch)
+            tau = self.saddle_criterion.tau_for(ext["lambda_max"])
+            top_eigs = [ext["lambda_max"], ext["lambda_min"]]
+            negatives = [(ext["lambda_min"], ext["v_min"])] if ext["lambda_min"] < -tau else []
+        else:
+            with hessian_compatible(model, data_batch) as (m, batch, use_cuda):
+                hess = self._hessian_factory(m, self.loss_fn, batch, use_cuda)
+                top_eigs, top_vecs = hess.eigenvalues(top_n=group["n_nhe_eigs"])
+            negatives = [(float(ev), vec) for ev, vec in zip(top_eigs, top_vecs) if float(ev) < 0]
         if not negatives:
             self._n_nhe_no_negative += 1
             return False
