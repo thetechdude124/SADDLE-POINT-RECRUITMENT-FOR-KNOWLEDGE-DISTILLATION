@@ -95,3 +95,128 @@ def batch_loss(model: nn.Module, criterion: nn.Module, data_batch: tuple) -> flo
     x, y = data_batch[0], data_batch[1]
     device = next(model.parameters()).device
     return float(criterion(model(x.to(device)), y.to(device)).detach().cpu())
+
+
+# --------------------------------------------------------------------------- #
+# Direct Hessian-vector products and extreme eigenpairs
+# --------------------------------------------------------------------------- #
+
+class HessianOperator:
+    """Hessian-vector products of ``loss_fn(model(x), y)`` on one fixed batch.
+
+    Builds the gradient graph once (``create_graph=True``) and evaluates ``H v`` by a
+    second backward pass. Vectors are flat 1-D tensors over the trainable parameters.
+    ``n_hvp`` counts the products performed.
+    """
+
+    def __init__(self, model: nn.Module, loss_fn: nn.Module, batch: tuple):
+        self.model = model
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.shapes = [p.shape for p in self.params]
+        self.numels = [p.numel() for p in self.params]
+        self.n = sum(self.numels)
+        self.device = self.params[0].device
+        x, y = batch[0].to(self.device), batch[1].to(self.device)
+        self.loss = loss_fn(model(x), y)
+        self.grads = torch.autograd.grad(self.loss, self.params, create_graph=True)
+        self.grad_flat = torch.cat([g.reshape(-1) for g in self.grads]).detach()
+        self.n_hvp = 0
+
+    def unflatten(self, v: torch.Tensor):
+        out, i = [], 0
+        for shp, n in zip(self.shapes, self.numels):
+            out.append(v[i:i + n].view(shp)); i += n
+        return out
+
+    def hvp(self, v: torch.Tensor) -> torch.Tensor:
+        vs = self.unflatten(v.to(self.device, dtype=self.params[0].dtype))
+        hv = torch.autograd.grad(self.grads, self.params, grad_outputs=vs, retain_graph=True, allow_unused=True)
+        self.n_hvp += 1
+        return torch.cat([(h if h is not None else torch.zeros_like(p)).reshape(-1) for h, p in zip(hv, self.params)]).detach()
+
+    def release(self):
+        self.grads = None
+        self.loss = None
+
+
+def _power_iteration(matvec, n, device, dtype, max_iter=100, tol=1e-3, v0=None):
+    v = v0 if v0 is not None else torch.randn(n, device=device, dtype=dtype)
+    v = v / v.norm()
+    lam = 0.0
+    for _ in range(max_iter):
+        hv = matvec(v)
+        lam_new = float(torch.dot(v, hv))
+        nrm = float(hv.norm())
+        if nrm == 0.0:
+            return 0.0, v
+        v = hv / nrm
+        if abs(lam_new - lam) <= tol * max(abs(lam_new), 1e-12):
+            lam = lam_new
+            break
+        lam = lam_new
+    return lam, v
+
+
+def extreme_eigenpairs(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    batch: tuple,
+    k: int = 1,
+    *,
+    method: str = "lanczos",
+    max_iter: int = 100,
+    tol: float = 1e-3,
+) -> dict:
+    """Largest and most negative Hessian eigenpairs on ``batch``.
+
+    ``method="lanczos"`` uses ``scipy.sparse.linalg.eigsh`` (implicitly restarted Lanczos)
+    on a matrix-free operator, ``which="LA"`` then ``which="SA"``. ``method="power"`` uses
+    power iteration for the dominant eigenpair and shifted power iteration on
+    ``H - lambda_dom I`` for the opposite extreme. Only ``k=1`` is supported. The model's
+    train/eval mode and gradients are preserved; on MPS the computation runs on CPU.
+
+    Returns ``{"lambda_max", "v_max", "lambda_min", "v_min", "n_hvp", "method", "grad_norm"}``
+    with eigenvectors as lists of per-parameter tensors (PyHessian layout).
+    """
+
+    if k != 1:
+        raise NotImplementedError("extreme_eigenpairs supports k=1 only")
+    with hessian_compatible(model, batch) as (m, b, _):
+        m.eval()  # deterministic loss on the probe batch (no dropout); mode is restored on exit
+        op = HessianOperator(m, loss_fn, b)
+        n, dev, dt = op.n, op.device, op.params[0].dtype
+        used = method
+        if method == "lanczos":
+            try:
+                import numpy as np
+                from scipy.sparse.linalg import LinearOperator, eigsh
+
+                def mv(x):
+                    return op.hvp(torch.as_tensor(np.asarray(x, dtype=np.float64).ravel(), dtype=dt, device=dev)).double().cpu().numpy()
+
+                lin = LinearOperator((n, n), matvec=mv, dtype=np.float64)
+                ncv = min(n, 20)
+                w_max, v_max = eigsh(lin, k=1, which="LA", tol=tol, maxiter=max_iter * 10, ncv=ncv)
+                w_min, v_min = eigsh(lin, k=1, which="SA", tol=tol, maxiter=max_iter * 10, ncv=ncv)
+                lam_max, lam_min = float(w_max[0]), float(w_min[0])
+                vmax = torch.as_tensor(v_max[:, 0], dtype=dt, device=dev)
+                vmin = torch.as_tensor(v_min[:, 0], dtype=dt, device=dev)
+            except Exception:  # scipy missing or Lanczos failure: fall back to power iteration
+                used = "power"
+        if used == "power":
+            lam_dom, v_dom = _power_iteration(op.hvp, n, dev, dt, max_iter, tol)
+            lam_other, v_other = _power_iteration(lambda v: op.hvp(v) - lam_dom * v, n, dev, dt, max_iter, tol)
+            lam_other = lam_other + lam_dom
+            if lam_dom >= lam_other:
+                lam_max, vmax, lam_min, vmin = lam_dom, v_dom, lam_other, v_other
+            else:
+                lam_max, vmax, lam_min, vmin = lam_other, v_other, lam_dom, v_dom
+        grad_norm = float(op.grad_flat.norm())
+        n_hvp = op.n_hvp
+        out = {
+            "lambda_max": lam_max, "lambda_min": lam_min, "n_hvp": n_hvp, "method": used, "grad_norm": grad_norm,
+            "v_max": [t.detach().clone() for t in op.unflatten(vmax / vmax.norm())],
+            "v_min": [t.detach().clone() for t in op.unflatten(vmin / vmin.norm())],
+        }
+        op.release()
+    return out
