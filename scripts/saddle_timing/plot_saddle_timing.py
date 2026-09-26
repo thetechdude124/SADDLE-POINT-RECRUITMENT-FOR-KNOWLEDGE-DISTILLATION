@@ -38,13 +38,27 @@ def mean_sd(vals):
     return st.mean(vals), (st.stdev(vals) if len(vals) > 1 else 0.0)
 
 
+def reclassify(r):
+    """Class of the refined point, honouring convergence: unconverged points are not saddles."""
+    rf = r["refine"]; lmin = r["lambda_min_after"]; acc = r["refined_val"]["acc"]; loss = r["refined_loss_probe"]
+    if not rf["converged"]:
+        return "unconverged_negcurv" if lmin < 0 else "unconverged"
+    if lmin >= -0.1:
+        return "minimum_or_flat"
+    if abs(loss - LN2) <= 0.02 * LN2 or acc < 55.0:
+        return "trivial_saddle"
+    if acc > 70.0:
+        return "informative_saddle"
+    return "weak_saddle"
+
+
 def core_table(T):
     rows = []
     fracs = sorted({m["fraction"] for t in T.values() for m in t.get("metrics", [])})
     for f in fracs:
         ms = [m for t in T.values() for m in t.get("metrics", []) if m["fraction"] == f]
         rs = [r for t in T.values() for r in t.get("refined", []) if r["fraction"] == f]
-        classes = [r["class"] for r in rs]
+        classes = [reclassify(r) for r in rs]
         rows.append({
             "fraction": f,
             "val_acc": mean_sd([m["val"]["acc"] for m in ms]), "val_loss": mean_sd([m["val"]["loss"] for m in ms]),
