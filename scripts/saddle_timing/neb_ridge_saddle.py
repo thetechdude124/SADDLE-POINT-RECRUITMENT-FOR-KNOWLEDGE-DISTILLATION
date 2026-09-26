@@ -209,7 +209,7 @@ def main():
                "endpoint_dist_l2": float((a - b).norm()), "neb_images": args.neb_images}
         log({"pair": key, "endpoints": rec["endpoint_val"], "train_loss": rec["endpoint_train_loss_full"], "l2": rec["endpoint_dist_l2"]})
         # linear path for reference
-        lin = [fl.loss_batched(a + t * (b - a), data.x_tr, data.y_tr) for t in torch.linspace(0, 1, 11)]
+        lin = [fl.loss_batched(a + float(t) * (b - a), data.x_tr, data.y_tr) for t in torch.linspace(0, 1, 11)]
         rec["linear_path_train_loss"] = lin; rec["linear_barrier_train"] = max(lin) - 0.5 * (lin[0] + lin[-1])
         # string + climbing image
         nodes, ci, hist = string_method(fl, a, b, args, log)
