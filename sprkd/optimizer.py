@@ -643,6 +643,8 @@ class SPRKD(torch.optim.Optimizer):
             negatives = [(float(ev), vec) for ev, vec in zip(top_eigs, top_vecs) if float(ev) < 0]
         if not negatives:
             self._n_nhe_no_negative += 1
+            self.events.append({"kind": "nhe", "step": self._step_count, "eigenvalues": [float(e) for e in top_eigs],
+                                "n_negative": 0, "applied": False, "reverted": False})
             return False
 
         params = group["params"]
