@@ -106,3 +106,21 @@ def test_nhe_lambda_min_direction_on_quadratic():
     d = m.w.detach() - before
     assert abs(float(d.norm()) - 0.3) < 1e-4 and abs(float(d[4])) > 0.29 and float(d[4]) > 0   # away from 0 along -grad direction
     assert opt.events[-1]["post_loss"] < opt.events[-1]["pre_loss"]
+
+
+def test_extreme_eigenpairs_k_most_negative():
+    D = torch.tensor([3.0, 1.0, 0.5, -0.5, -2.0, -1.0])
+
+    class Q(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.tensor([0.7, -0.4, 0.3, 0.9, -0.6, 0.2]))
+
+        def forward(self, x):
+            return (0.5 * (self.w * D * self.w).sum()).expand(x.shape[0], 1)
+
+    r = extreme_eigenpairs(Q(), _MeanLoss(), BATCH, k=3)
+    assert [round(v, 3) for v in r["lambda_min_k"]] == [-2.0, -1.0, -0.5]
+    assert abs(r["lambda_max"] - 3.0) < 1e-3
+    with pytest.raises(NotImplementedError):
+        extreme_eigenpairs(Q(), _MeanLoss(), BATCH, k=2, method="power")
