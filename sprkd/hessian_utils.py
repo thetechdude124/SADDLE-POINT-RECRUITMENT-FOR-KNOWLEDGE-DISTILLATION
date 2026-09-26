@@ -179,8 +179,10 @@ def extreme_eigenpairs(
     with eigenvectors as lists of per-parameter tensors (PyHessian layout).
     """
 
-    if k != 1:
-        raise NotImplementedError("extreme_eigenpairs supports k=1 only")
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if k > 1 and method != "lanczos":
+        raise NotImplementedError("k > 1 is supported with method='lanczos' only")
     with hessian_compatible(model, batch) as (m, b, _):
         m.eval()  # deterministic loss on the probe batch (no dropout); mode is restored on exit
         op = HessianOperator(m, loss_fn, b)
@@ -195,10 +197,13 @@ def extreme_eigenpairs(
                     return op.hvp(torch.as_tensor(np.asarray(x, dtype=np.float64).ravel(), dtype=dt, device=dev)).double().cpu().numpy()
 
                 lin = LinearOperator((n, n), matvec=mv, dtype=np.float64)
-                ncv = min(n, 20)
+                ncv = min(n, max(20, 4 * k + 1))
                 w_max, v_max = eigsh(lin, k=1, which="LA", tol=tol, maxiter=max_iter * 10, ncv=ncv)
-                w_min, v_min = eigsh(lin, k=1, which="SA", tol=tol, maxiter=max_iter * 10, ncv=ncv)
+                w_min, v_min = eigsh(lin, k=k, which="SA", tol=tol, maxiter=max_iter * 10, ncv=ncv)
+                order = np.argsort(w_min)
+                w_min, v_min = w_min[order], v_min[:, order]
                 lam_max, lam_min = float(w_max[0]), float(w_min[0])
+                lambda_min_k = [float(w) for w in w_min]
                 vmax = torch.as_tensor(v_max[:, 0], dtype=dt, device=dev)
                 vmin = torch.as_tensor(v_min[:, 0], dtype=dt, device=dev)
             except Exception:  # scipy missing or Lanczos failure: fall back to power iteration
@@ -211,10 +216,12 @@ def extreme_eigenpairs(
                 lam_max, vmax, lam_min, vmin = lam_dom, v_dom, lam_other, v_other
             else:
                 lam_max, vmax, lam_min, vmin = lam_other, v_other, lam_dom, v_dom
+            lambda_min_k = [lam_min]
         grad_norm = float(op.grad_flat.norm())
         n_hvp = op.n_hvp
         out = {
-            "lambda_max": lam_max, "lambda_min": lam_min, "n_hvp": n_hvp, "method": used, "grad_norm": grad_norm,
+            "lambda_max": lam_max, "lambda_min": lam_min, "lambda_min_k": lambda_min_k,
+            "n_hvp": n_hvp, "method": used, "grad_norm": grad_norm,
             "v_max": [t.detach().clone() for t in op.unflatten(vmax / vmax.norm())],
             "v_min": [t.detach().clone() for t in op.unflatten(vmin / vmin.norm())],
         }
