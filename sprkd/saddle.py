@@ -25,7 +25,7 @@ from typing import Iterable, List, Literal, Optional, Sequence, Union
 import torch
 
 
-_RuleName = Literal["magnitude", "ratio", "both"]
+_RuleName = Literal["extreme", "magnitude", "ratio", "both"]
 
 
 @dataclass
@@ -34,7 +34,13 @@ class SaddleCriterion:
 
     Parameters
     ----------
-    rule : {"magnitude", "ratio", "both"}, default ``"magnitude"``
+    rule : {"extreme", "magnitude", "ratio", "both"}, default ``"extreme"``
+        ``"extreme"`` (default since 0.3.0): the point qualifies when ``lambda_max > 0`` and
+        ``lambda_min < -tau`` with ``lambda_max`` / ``lambda_min`` computed directly
+        (:func:`sprkd.hessian_utils.extreme_eigenpairs`). The other three rules act on the
+        top-k-by-magnitude eigenvalues and are kept to reproduce version 0.1/0.2 behaviour.
+    tau, tau_rel : float
+        Threshold for ``"extreme"``: absolute ``tau`` if given, else ``tau_rel * lambda_max``.
     alpha : float
         Ratio threshold (paper's :math:`\\alpha`), used by ``"ratio"`` and ``"both"``.
     magnitude_threshold : float
@@ -45,11 +51,17 @@ class SaddleCriterion:
         If set, a step qualifies only when the gradient L2 norm is at most this value.
     """
 
-    rule: _RuleName = "magnitude"
+    rule: _RuleName = "extreme"
     alpha: float = 0.4
     magnitude_threshold: float = 7.0
     require_negative_eigenvalue: bool = True
     max_grad_norm: Optional[float] = None
+    tau: Optional[float] = None
+    tau_rel: float = 0.05
+
+    def tau_for(self, lambda_max: float) -> float:
+        """Negative-curvature threshold: absolute ``tau`` if set, else ``tau_rel * lambda_max``."""
+        return float(self.tau) if self.tau is not None else self.tau_rel * max(float(lambda_max), 0.0)
 
 
 def _split_signs(eigenvalues: Sequence[float]):
@@ -66,9 +78,12 @@ def _split_signs(eigenvalues: Sequence[float]):
 
 
 def which_rules_fire(
-    eigenvalues: Sequence[float],
+    eigenvalues: Optional[Sequence[float]] = None,
     criterion: Optional[SaddleCriterion] = None,
     grad_norm: Optional[float] = None,
+    *,
+    lambda_max: Optional[float] = None,
+    lambda_min: Optional[float] = None,
 ) -> dict:
     """Evaluate every condition and return a dict of booleans plus the decision.
 
@@ -79,18 +94,26 @@ def which_rules_fire(
     if criterion is None:
         criterion = SaddleCriterion()
 
-    pos, neg, _ = _split_signs(eigenvalues)
+    grad_gate = bool(criterion.max_grad_norm is None or grad_norm is None or grad_norm <= criterion.max_grad_norm)
+    if criterion.rule == "extreme":
+        if lambda_max is None or lambda_min is None:
+            if eigenvalues is None:
+                raise ValueError("rule='extreme' needs lambda_max and lambda_min (or eigenvalues to take extremes of)")
+            lambda_max, lambda_min = max(float(e) for e in eigenvalues), min(float(e) for e in eigenvalues)
+        tau = criterion.tau_for(lambda_max)
+        out = {"lambda_max": float(lambda_max), "lambda_min": float(lambda_min), "tau": tau, "grad_gate": grad_gate,
+               "has_negative": lambda_min < 0, "extreme": bool(lambda_max > 0 and lambda_min < -tau)}
+        out["fired"] = bool(out["extreme"] and grad_gate)
+        return out
+
+    pos, neg, _ = _split_signs(eigenvalues or [])
     pos_mass = sum(pos)
     neg_mass = abs(sum(neg))
     out = {
         "has_negative": bool(neg),
         "ratio": bool(neg_mass >= criterion.alpha * pos_mass),
         "magnitude": bool(neg_mass >= criterion.magnitude_threshold),
-        "grad_gate": bool(
-            criterion.max_grad_norm is None
-            or grad_norm is None
-            or grad_norm <= criterion.max_grad_norm
-        ),
+        "grad_gate": grad_gate,
         "neg_mass": neg_mass,
         "pos_mass": pos_mass,
     }
@@ -109,13 +132,16 @@ def which_rules_fire(
 
 
 def is_strong_saddle_point(
-    eigenvalues: Sequence[float],
+    eigenvalues: Optional[Sequence[float]] = None,
     criterion: Optional[SaddleCriterion] = None,
     grad_norm: Optional[float] = None,
+    *,
+    lambda_max: Optional[float] = None,
+    lambda_min: Optional[float] = None,
 ) -> bool:
-    """Return ``True`` iff ``eigenvalues`` (and optionally ``grad_norm``) qualify."""
+    """Return ``True`` iff the eigen-information (and optionally ``grad_norm``) qualifies."""
 
-    return which_rules_fire(eigenvalues, criterion, grad_norm)["fired"]
+    return which_rules_fire(eigenvalues, criterion, grad_norm, lambda_max=lambda_max, lambda_min=lambda_min)["fired"]
 
 
 @dataclass
@@ -262,3 +288,113 @@ def estimate_top_eigenvalues(
     from sprkd.hessian_utils import top_eigenpairs
 
     return top_eigenpairs(model, criterion, data, top_n=top_n)
+
+
+# --------------------------------------------------------------------------- #
+# Stationary-point refinement
+# --------------------------------------------------------------------------- #
+
+def refine_to_stationary(
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    batch: tuple,
+    *,
+    max_steps: int = 50,
+    grad_tol: float = 1e-2,
+    lr: float = 1e-2,
+    method: str = "gn",
+    solver_iters: int = 30,
+    verbose: bool = False,
+) -> dict:
+    """Move ``model`` (in place) from a candidate snapshot toward a stationary point of the
+    probe-batch loss by minimising ``0.5 * ||grad L||^2``.
+
+    ``method="gn"`` (default): Newton/Gauss-Newton step for the root of ``grad L = 0``:
+    solve ``H d = g`` with MINRES (matrix-free, indefinite ``H`` allowed), then a
+    backtracking line search on the gradient norm; if no step length reduces it, fall back
+    to one gradient-norm-descent step ``theta -= lr * H g``. ``method="gradnorm"``: only
+    the descent step (double backward through the gradient norm). Stops when the gradient
+    norm is at most ``grad_tol`` or after ``max_steps``.
+
+    The stationary point is that of the loss on ``batch``, not of the full training loss.
+
+    Returns a dict with ``grad_norm_before``, ``grad_norm_after``, ``loss_before``,
+    ``loss_after``, ``steps``, ``n_hvp``, ``converged``, ``wall_clock_s``.
+    """
+
+    import time
+
+    from sprkd.hessian_utils import HessianOperator, hessian_compatible
+
+    t0 = time.time()
+    rec = {"steps": 0, "n_hvp": 0, "converged": False, "method": method}
+    with hessian_compatible(model, batch) as (m, b, _):
+        m.eval()  # deterministic probe-batch loss (no dropout); mode restored on exit
+        params = [p for p in m.parameters() if p.requires_grad]
+
+        def flat_params():
+            return torch.cat([p.detach().reshape(-1) for p in params])
+
+        def set_params(vec):
+            i = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel(); p.copy_(vec[i:i + n].view_as(p)); i += n
+
+        op = HessianOperator(m, loss_fn, b)
+        rec["loss_before"] = float(op.loss.detach()); rec["grad_norm_before"] = float(op.grad_flat.norm())
+        g_norm = rec["grad_norm_before"]
+        for step in range(max_steps):
+            if g_norm <= grad_tol:
+                rec["converged"] = True
+                break
+            g = op.grad_flat
+            theta = flat_params()
+            moved = False
+            if method == "gn":
+                try:
+                    import numpy as np
+                    from scipy.sparse.linalg import LinearOperator, minres
+
+                    dev, dt = g.device, g.dtype
+                    lin = LinearOperator((op.n, op.n), matvec=lambda x: op.hvp(torch.as_tensor(np.asarray(x, dtype=np.float64).ravel(), dtype=dt, device=dev)).double().cpu().numpy(), dtype=np.float64)
+                    d_np, _ = minres(lin, g.double().cpu().numpy(), maxiter=solver_iters, rtol=1e-4)
+                    d = torch.as_tensor(d_np, dtype=dt, device=dev)
+                    for alpha in (1.0, 0.5, 0.25, 0.1, 0.05):
+                        set_params(theta - alpha * d)
+                        op_new = HessianOperator(m, loss_fn, b)
+                        rec["n_hvp"] += op.n_hvp
+                        if float(op_new.grad_flat.norm()) < g_norm:
+                            op.release(); op = op_new; moved = True
+                            break
+                        op_new.release()
+                except Exception:
+                    moved = False
+            if not moved:  # gradient-norm descent: grad of 0.5||g||^2 is H g, with backtracking
+                set_params(theta)
+                op.release(); op = HessianOperator(m, loss_fn, b)
+                hg = op.hvp(op.grad_flat)
+                rec["n_hvp"] += op.n_hvp
+                for alpha in (lr, lr / 4, lr / 16, lr / 64, lr / 256):
+                    set_params(theta - alpha * hg)
+                    op_new = HessianOperator(m, loss_fn, b)
+                    if float(op_new.grad_flat.norm()) < g_norm:
+                        op.release(); op = op_new; moved = True
+                        break
+                    op_new.release()
+                if not moved:  # stalled: restore and stop
+                    set_params(theta)
+                    op.release(); op = HessianOperator(m, loss_fn, b)
+                    rec["stalled"] = True
+                    rec["steps"] = step + 1
+                    break
+            g_norm = float(op.grad_flat.norm())
+            rec["steps"] = step + 1
+            if verbose:
+                print(f"refine step {step + 1}: grad_norm={g_norm:.4g} loss={float(op.loss.detach()):.4f}")
+        rec["converged"] = rec["converged"] or g_norm <= grad_tol
+        rec["grad_norm_after"] = g_norm; rec["loss_after"] = float(op.loss.detach())
+        rec["n_hvp"] += op.n_hvp
+        op.release()
+    rec["wall_clock_s"] = round(time.time() - t0, 3)
+    return rec
