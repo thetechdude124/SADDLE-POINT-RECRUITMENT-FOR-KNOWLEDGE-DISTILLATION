@@ -33,7 +33,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 try:
     __version__ = _pkg_version("sprkd")
 except PackageNotFoundError:  # pragma: no cover - fallback when not installed
-    __version__ = "0.2.0"
+    __version__ = "0.3.0"
 
 from sprkd.optimizer import SPRKD
 from sprkd.saddle import (
