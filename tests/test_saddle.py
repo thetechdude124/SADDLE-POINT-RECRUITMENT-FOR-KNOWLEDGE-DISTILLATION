@@ -24,16 +24,20 @@ def test_pure_minimum_is_not_a_saddle():
     assert is_strong_saddle_point(eigs) is False
 
 
-def test_default_rule_is_magnitude_canonical_colab():
-    """Canonical Colab: ``abs(sum(neg_eigs)) >= 7`` is the only test."""
+def test_magnitude_rule_matches_canonical_colab():
+    """Canonical Colab (0.1/0.2 default): ``abs(sum(neg_eigs)) >= 7`` is the only test.
+    Since 0.3.0 the default rule is ``extreme`` (direct lambda_max / lambda_min)."""
 
-    assert is_strong_saddle_point([10.0, -8.0]) is True   # |sum_neg|=8 >= 7
-    assert is_strong_saddle_point([10.0, -6.5]) is False  # |sum_neg|=6.5 < 7
+    crit = SaddleCriterion(rule="magnitude")
+    assert is_strong_saddle_point([10.0, -8.0], crit) is True   # |sum_neg|=8 >= 7
+    assert is_strong_saddle_point([10.0, -6.5], crit) is False  # |sum_neg|=6.5 < 7
+    assert SaddleCriterion().rule == "extreme"
 
 
 def test_pure_maximum_passes_magnitude_rule():
     eigs = [-10.0, -8.0, -5.0, -1.0]
-    assert is_strong_saddle_point(eigs) is True  # |sum_neg| = 24 >= 7
+    assert is_strong_saddle_point(eigs, SaddleCriterion(rule="magnitude")) is True  # |sum_neg| = 24 >= 7
+    assert is_strong_saddle_point(eigs) is False  # extreme rule: lambda_max must be positive
 
 
 def test_classical_saddle_qualifies_under_both_rules():

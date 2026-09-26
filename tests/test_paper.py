@@ -104,8 +104,8 @@ def test_paper_hyperparameter_defaults_documented():
     assert crit.magnitude_threshold == PAPER_HYPERPARAMS["saddle_beta"]
 
 
-def test_released_checkpoints_use_magnitude_rule_by_default(student_model, cpu_loss):
-    """Canonical Colab / released artifacts: |sum(neg)| >= 7 only."""
+def test_released_checkpoints_rule_is_available_and_default_is_extreme(student_model, cpu_loss):
+    """Released artifacts used |sum(neg)| >= 7 (rule="magnitude"); 0.3.0 defaults to the direct lambda rule."""
 
     base = torch.optim.Adam(student_model.parameters(), lr=1e-3)
     sprkd = SPRKD(
@@ -114,8 +114,9 @@ def test_released_checkpoints_use_magnitude_rule_by_default(student_model, cpu_l
         loss_fn=cpu_loss,
         teacher_saddle_points=[torch.zeros_like(p) for p in student_model.parameters()],
     )
-    assert sprkd.saddle_criterion.rule == "magnitude"
+    assert sprkd.saddle_criterion.rule == "extreme"
     assert sprkd.saddle_criterion.magnitude_threshold == 7.0
+    assert SaddleCriterion(rule="magnitude").magnitude_threshold == 7.0
 
 
 # ---------------------------------------------------------------------------

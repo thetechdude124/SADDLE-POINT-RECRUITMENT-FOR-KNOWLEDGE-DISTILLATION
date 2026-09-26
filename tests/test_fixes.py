@@ -125,7 +125,7 @@ def test_fix3_nhe_is_a_negative_curvature_step_with_revert():
     model = _QuadraticSaddle()
     opt = SPRKD([model.w], base_optimizer=torch.optim.SGD([model.w], lr=0.1), loss_fn=_MeanLoss(),
                 teacher_saddle_points=[torch.zeros(2)], nhe_step_mode="fixed", nhe_step_size=0.2,
-                hessian_factory=_stub_factory(-1.0, [0.0, 1.0]))
+                nhe_direction="topk", hessian_factory=_stub_factory(-1.0, [0.0, 1.0]))
     _MeanLoss()(model(x), y).backward()
     w_before = model.w.detach().clone()
     applied = opt._negative_hessian_eigenstep(group=opt.param_groups[0], model=model, data_batch=(x, y))
@@ -141,7 +141,7 @@ def test_fix3_nhe_is_a_negative_curvature_step_with_revert():
     model2 = _QuadraticSaddle()
     opt2 = SPRKD([model2.w], base_optimizer=torch.optim.SGD([model2.w], lr=0.1), loss_fn=_MeanLoss(),
                  teacher_saddle_points=[torch.zeros(2)], nhe_step_mode="fixed", nhe_step_size=1.0,
-                 hessian_factory=_stub_factory(-1.0, [1.0, 0.0]))
+                 nhe_direction="topk", hessian_factory=_stub_factory(-1.0, [1.0, 0.0]))
     _MeanLoss()(model2(x), y).backward()
     w2 = model2.w.detach().clone()
     applied2 = opt2._negative_hessian_eigenstep(group=opt2.param_groups[0], model=model2, data_batch=(x, y))
@@ -151,7 +151,7 @@ def test_fix3_nhe_is_a_negative_curvature_step_with_revert():
 
     # no negative eigenvalue -> nothing happens, counted
     opt3 = SPRKD([model.w], base_optimizer=torch.optim.SGD([model.w], lr=0.1), loss_fn=_MeanLoss(),
-                 teacher_saddle_points=[torch.zeros(2)], hessian_factory=_stub_factory(0.5, [0.0, 1.0]))
+                 teacher_saddle_points=[torch.zeros(2)], nhe_direction="topk", hessian_factory=_stub_factory(0.5, [0.0, 1.0]))
     assert not opt3._negative_hessian_eigenstep(group=opt3.param_groups[0], model=model, data_batch=(x, y))
     assert opt3.counters()["nhe_no_negative"] == 1
 
@@ -196,7 +196,7 @@ def test_fix5_grad_norm_gate_and_recording_counters(teacher_model, tiny_batch, c
     x, y = tiny_batch
     base = torch.optim.SGD(teacher_model.parameters(), lr=1e-3)
     opt = SPRKD(teacher_model.parameters(), base_optimizer=base, loss_fn=cpu_loss, is_teacher=True,
-                saddle_steps=1, saddle_criterion=SaddleCriterion(max_grad_norm=1e9), hessian_factory=_Stub())
+                saddle_steps=1, saddle_criterion=SaddleCriterion(rule="magnitude", max_grad_norm=1e9), hessian_factory=_Stub())
     for _ in range(2):
         opt.zero_grad()
         loss = cpu_loss(teacher_model(x), y)
@@ -259,7 +259,7 @@ def test_fix3_events_are_recorded():
     model = _QuadraticSaddle()
     opt = SPRKD([model.w], base_optimizer=torch.optim.SGD([model.w], lr=0.1), loss_fn=_MeanLoss(),
                 teacher_saddle_points=[torch.zeros(2)], nhe_step_mode="fixed", nhe_step_size=0.2,
-                hessian_factory=_stub_factory(-1.0, [0.0, 1.0]))
+                nhe_direction="topk", hessian_factory=_stub_factory(-1.0, [0.0, 1.0]))
     _MeanLoss()(model(x), y).backward()
     opt._negative_hessian_eigenstep(group=opt.param_groups[0], model=model, data_batch=(x, y))
     assert len(opt.events) == 1 and opt.events[0]["kind"] == "nhe"

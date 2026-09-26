@@ -137,6 +137,7 @@ def test_teacher_mode_skips_non_saddle(teacher_model, tiny_batch, cpu_loss):
         loss_fn=cpu_loss,
         is_teacher=True,
         saddle_steps=1,
+        saddle_criterion=SaddleCriterion(rule="magnitude"),
         hessian_factory=stub,
     )
     logits = teacher_model(x)
@@ -321,8 +322,8 @@ def test_default_nhe_mode_is_adaptive(student_model, cpu_loss):
     assert sprkd.param_groups[0]["nhe_step_mode"] == "adaptive"
 
 
-def test_default_saddle_threshold_matches_canonical_colab(student_model, cpu_loss):
-    """Canonical Colab: ``abs(sum(neg_eigs)) >= 7`` (`magnitude` rule)."""
+def test_default_saddle_criterion_is_extreme_and_legacy_threshold_kept(student_model, cpu_loss):
+    """0.3.0 default: direct lambda rule; the canonical Colab threshold (7) is kept for the legacy rule."""
 
     base = torch.optim.Adam(student_model.parameters(), lr=1e-3)
     asr = [torch.zeros_like(p) for p in student_model.parameters()]
@@ -332,7 +333,7 @@ def test_default_saddle_threshold_matches_canonical_colab(student_model, cpu_los
         loss_fn=cpu_loss,
         teacher_saddle_points=asr,
     )
-    assert sprkd.saddle_criterion.rule == "magnitude"
+    assert sprkd.saddle_criterion.rule == "extreme"
     assert sprkd.saddle_criterion.magnitude_threshold == 7.0
 
 
@@ -384,6 +385,7 @@ def test_nhe_adaptive_step_is_min_of_cap_and_eigenvalue(student_model, tiny_batc
         nhe_step_mode="adaptive",
         nhe_step_size=0.1,
         max_nhe_steps=10,
+        nhe_direction="topk",
         revert_on_increase=False,
         hessian_factory=_Stub(lam),
     )
@@ -411,6 +413,7 @@ def test_nhe_fixed_uses_constant_step(student_model, tiny_batch, cpu_loss):
         nhe_step_mode="fixed",
         nhe_step_size=0.1,
         max_nhe_steps=10,
+        nhe_direction="topk",
         revert_on_increase=False,
         hessian_factory=_Stub(),
     )
