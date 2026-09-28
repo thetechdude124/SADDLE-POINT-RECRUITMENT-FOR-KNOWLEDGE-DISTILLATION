@@ -124,3 +124,11 @@ def test_extreme_eigenpairs_k_most_negative():
     assert abs(r["lambda_max"] - 3.0) < 1e-3
     with pytest.raises(NotImplementedError):
         extreme_eigenpairs(Q(), _MeanLoss(), BATCH, k=2, method="power")
+
+
+@pytest.mark.parametrize("method", ["lm", "adam"])
+def test_refine_alternative_solvers_reach_the_quadratic_saddle(method):
+    m = _Quadratic([0.7, -0.4, 0.3, 0.9, -0.6])
+    r = refine_to_stationary(m, _MeanLoss(), BATCH, max_steps=3000, grad_tol=1e-4, lr=0.05, method=method, solver_iters=20)
+    assert r["grad_norm_after"] <= 1e-3 * 5 or r["converged"]
+    assert m.w.detach().abs().max() < 0.05

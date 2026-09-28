@@ -19,6 +19,8 @@ after the fact.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Iterable, List, Literal, Optional, Sequence, Union
 
@@ -302,14 +304,23 @@ def refine_to_stationary(
     max_steps: int = 50,
     grad_tol: float = 1e-2,
     lr: float = 1e-2,
-    method: str = "gn",
+    method: str = "lm",
     solver_iters: int = 30,
     verbose: bool = False,
+    lm_damping: float = 1e-2,
 ) -> dict:
     """Move ``model`` (in place) from a candidate snapshot toward a stationary point of the
     probe-batch loss by minimising ``0.5 * ||grad L||^2``.
 
-    ``method="gn"`` (default): Newton/Gauss-Newton step for the root of ``grad L = 0``:
+    ``method="lm"`` (default since 0.3.1): Levenberg-Marquardt Newton-Krylov on the
+    residual ``grad L``. Each step solves ``(H^2 + mu I) d = -H g`` by conjugate gradients
+    (``H^2`` is positive semi-definite even when ``H`` is indefinite, so CG is well posed;
+    every CG iteration costs two Hessian-vector products), takes ``theta += d`` if the
+    gradient norm decreases and shrinks ``mu`` by 3x, otherwise rejects the step and grows
+    ``mu`` by 4x. This is the standard trust-region-like solver for stationary points and
+    converges to saddles as readily as to minima. ``method="adam"``: first-order Adam on
+    ``0.5 ||grad L||^2`` (one HVP per step, robust on piecewise-linear ReLU landscapes where
+    Newton-type steps stall at kinks). ``method="gn"``: Newton step via MINRES:
     solve ``H d = g`` with MINRES (matrix-free, indefinite ``H`` allowed), then a
     backtracking line search on the gradient norm; if no step length reduces it, fall back
     to one gradient-norm-descent step ``theta -= lr * H g``. ``method="gradnorm"``: only
@@ -351,6 +362,49 @@ def refine_to_stationary(
             g = op.grad_flat
             theta = flat_params()
             moved = False
+            if method == "adam":
+                # first-order minimisation of 0.5||g||^2 with Adam on the flat parameters; one HVP per step
+                st = rec.setdefault("_adam", {"m": torch.zeros_like(g), "v": torch.zeros_like(g), "t": 0})
+                hg = op.hvp(g)
+                st["t"] += 1; b1, b2 = 0.9, 0.999
+                st["m"] = b1 * st["m"] + (1 - b1) * hg; st["v"] = b2 * st["v"] + (1 - b2) * hg * hg
+                mhat = st["m"] / (1 - b1 ** st["t"]); vhat = st["v"] / (1 - b2 ** st["t"])
+                set_params(theta - lr * mhat / (vhat.sqrt() + 1e-8))
+                rec["n_hvp"] += op.n_hvp
+                op.release(); op = HessianOperator(m, loss_fn, b)
+                g_norm = float(op.grad_flat.norm()); rec["steps"] = step + 1
+                rec["best_grad_norm"] = min(rec.get("best_grad_norm", g_norm), g_norm)
+                continue
+            if method == "lm":
+                mu = rec.get("_mu", lm_damping)
+                # CG on (H^2 + mu I) d = -H g
+                rhs = -op.hvp(g)
+                d = torch.zeros_like(g); r = rhs.clone(); pdir = r.clone(); rs = float(torch.dot(r, r))
+                for _ in range(solver_iters):
+                    hp = op.hvp(op.hvp(pdir)) + mu * pdir
+                    alpha = rs / max(float(torch.dot(pdir, hp)), 1e-30)
+                    d = d + alpha * pdir; r = r - alpha * hp
+                    rs_new = float(torch.dot(r, r))
+                    if math.sqrt(rs_new) <= 1e-3 * math.sqrt(float(torch.dot(rhs, rhs))):
+                        break
+                    pdir = r + (rs_new / rs) * pdir; rs = rs_new
+                set_params(theta + d)
+                op_new = HessianOperator(m, loss_fn, b)
+                rec["n_hvp"] += op.n_hvp
+                if float(op_new.grad_flat.norm()) < g_norm:
+                    op.release(); op = op_new; moved = True
+                    rec["_mu"] = max(mu / 3.0, 1e-8)
+                else:
+                    op_new.release(); set_params(theta)
+                    op.release(); op = HessianOperator(m, loss_fn, b)   # params changed in place: rebuild the graph
+                    rec["_mu"] = mu * 4.0
+                    rec["n_lm_rejects"] = rec.get("n_lm_rejects", 0) + 1
+                    rec["steps"] = step + 1
+                    if rec["_mu"] > 1e6:
+                        rec["stalled"] = True
+                        break
+                    g_norm = float(op.grad_flat.norm())
+                    continue
             if method == "gn":
                 try:
                     import numpy as np
@@ -396,5 +450,6 @@ def refine_to_stationary(
         rec["grad_norm_after"] = g_norm; rec["loss_after"] = float(op.loss.detach())
         rec["n_hvp"] += op.n_hvp
         op.release()
+    rec.pop("_mu", None); rec.pop("_adam", None)
     rec["wall_clock_s"] = round(time.time() - t0, 3)
     return rec
