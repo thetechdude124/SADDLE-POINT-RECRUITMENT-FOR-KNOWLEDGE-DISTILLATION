@@ -51,7 +51,7 @@ def _sweep_once(log) -> int:
         rec = B.loads(path.read_text())
         if rec["status"] != B.LIVE:
             continue
-        reasons = B.watchdog_reasons(rec, now, STALE_S, OVERRUN_SLACK_S)
+        reasons = B.watchdog_reasons(rec, now, rec.get("stale_s", STALE_S), OVERRUN_SLACK_S)
         if not reasons:
             log(f"{path.name}: live, accrued ${B.accrued_usd(rec, now):.2f} of ${rec['budget_usd']:.0f}, {len(B.live_runs(rec))} runs, heartbeat {int(now - rec['heartbeat_at'])}s ago")
             continue
