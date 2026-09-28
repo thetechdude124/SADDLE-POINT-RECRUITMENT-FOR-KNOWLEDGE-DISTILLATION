@@ -85,8 +85,16 @@ def worst_case_usd(rec: dict, now: Optional[float] = None) -> float:
     return total
 
 
-def over_budget(rec: dict, now: Optional[float] = None) -> bool:
-    return accrued_usd(rec, now) >= rec["budget_usd"]
+def burn_usd_per_s(rec: dict) -> float:
+    """Current spend rate of all live runs."""
+    return sum(r["rate_usd_h"] for r in rec["runs"].values() if r["finished_at"] is None) / 3600.0
+
+
+def over_budget(rec: dict, now: Optional[float] = None, lookahead_s: float = 0.0) -> bool:
+    """True when accrued cost, plus what live runs will burn in the next ``lookahead_s``, reaches
+    the budget. The driver passes one poll interval (plus margin) so it stops before the cap
+    instead of up to one interval after it (measured overshoot on Modal: $0.06 on a $0.03 budget)."""
+    return accrued_usd(rec, now) + burn_usd_per_s(rec) * lookahead_s >= rec["budget_usd"]
 
 
 def heartbeat_stale(rec: dict, now: Optional[float] = None, max_age_s: float = 20 * 60) -> bool:
@@ -127,8 +135,8 @@ def should_abort_run(progress: Optional[dict], timeout_s: int, min_elapsed_s: fl
 
 def summary_lines(rec: dict, now: Optional[float] = None) -> List[str]:
     now = time.time() if now is None else now
-    out = [f"launch {rec['matrix']} status={rec['status']} budget=${rec['budget_usd']:.0f} accrued=${accrued_usd(rec, now):.2f} "
-           f"worst_case=${worst_case_usd(rec, now):.0f} heartbeat_age={int(now - rec['heartbeat_at'])}s runs={len(rec['runs'])} live={len(live_runs(rec))}"]
+    out = [f"launch {rec['matrix']} status={rec['status']} budget=${rec['budget_usd']:.2f} accrued=${accrued_usd(rec, now):.2f} "
+           f"worst_case=${worst_case_usd(rec, now):.2f} heartbeat_age={int(now - rec['heartbeat_at'])}s runs={len(rec['runs'])} live={len(live_runs(rec))}"]
     for n, r in rec["runs"].items():
         p = r.get("progress"); proj = projected_wall_s(p)
         out.append(f"  {n:<28} {r['gpu']:<5} {r['status']:<10} elapsed={int(run_elapsed_s(r, now))}s timeout={r['timeout_s']}s "
@@ -192,7 +200,10 @@ def run_budgeted(waves, rec, *, spawn, poll, cancel, read_log, save, log, now, s
                     finish_run(rec, n, "ok" if ok else "failed", t)
                     log(f"{n} {'ok' if ok else 'FAILED'} " + (str({k: res.get(k) for k in ('returncode', 'wall_clock_s')}) if isinstance(res, dict) else repr(res)))
                     continue
-                r["progress"] = parse_progress(read_log(n))
+                prog = parse_progress(read_log(n))
+                if prog is not None and prog["elapsed_s"] > run_elapsed_s(r, t) + 120:
+                    prog = None  # claims more elapsed time than this run has existed: a stale log from an earlier launch
+                r["progress"] = prog
                 if should_abort_run(r["progress"], r["timeout_s"]):
                     cancel(r["call_id"]); finish_run(rec, n, "aborted_projection", t)
                     log(f"ABORT {n}: progress projects {int(projected_wall_s(r['progress']))}s against a {r['timeout_s']}s timeout")
@@ -201,7 +212,7 @@ def run_budgeted(waves, rec, *, spawn, poll, cancel, read_log, save, log, now, s
                     cancel(r["call_id"]); finish_run(rec, n, "aborted_overrun", t)
                     log(f"ABORT {n}: alive {int(run_elapsed_s(r, t))}s past a {r['timeout_s']}s timeout")
             rec["heartbeat_at"] = t
-            if over_budget(rec, t):
+            if over_budget(rec, t, lookahead_s=1.5 * poll_s + 15):
                 for n in live_runs(rec):
                     cancel(rec["runs"][n]["call_id"]); finish_run(rec, n, "cancelled", t)
                 rec["status"] = BUDGET_STOP
@@ -229,10 +240,14 @@ def watchdog_reasons(rec: dict, now: float, stale_s: float = 20 * 60, overrun_sl
     return out
 
 
-def launch_refusal(est: dict, max_cost_usd: float, driver: bool, live_record_exists: bool, dry_run: bool = False) -> Optional[str]:
+def launch_refusal(est: dict, max_cost_usd: float, driver: bool, live_record_exists: bool, dry_run: bool = False,
+                   allow_unmeasured: bool = False) -> Optional[str]:
     """Reason the launcher must refuse, or None. Pure so it is tested offline."""
     if dry_run:
         return None
+    if est.get("unmeasured") and not allow_unmeasured:
+        return (f"refusing: no measured step time on the target GPU for {est['unmeasured'][:5]}"
+                f"{' ...' if len(est['unmeasured']) > 5 else ''}; run a timing probe first (or --allow-unmeasured)")
     if not driver:
         return "refusing to run the wave loop from this machine; launch with --driver --detach"
     if not max_cost_usd:

@@ -86,7 +86,7 @@ DATASET_TIME_MULT = {"cifar100": 1.0, "tinyimagenet": 2.0, "imagenet100": 4.0}
 
 PAIRS = [("resnet32x4", "resnet8x4"), ("wrn40_2", "wrn16_2"), ("vgg13", "vgg8"), ("resnet110", "resnet20")]
 SMALL_TEACHER_PAIRS = [("resnet20", "resnet8x4"), ("wrn16_2", "wrn40_2")]
-RUNNER_SCRIPTS = {"train": "train.py", "sprkd": "sprkd_runner.py", "malaria": "malaria_e1.py", "cifar_saddle": "cifar_saddle_study.py", "control": "control_run.py"}
+RUNNER_SCRIPTS = {"train": "train.py", "sprkd": "sprkd_runner.py", "malaria": "malaria_e1.py", "cifar_saddle": "cifar_saddle_study.py", "control": "control_run.py", "probe": "gpu_probe.py"}
 GPU_SADDLE = os.environ.get("SPRKD_GPU_SADDLE", "A100")
 MALARIA_URL = "https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip"
 CRD_TEACHER_FILES = {"resnet32x4": "resnet32x4_vanilla", "wrn40_2": "wrn_40_2_vanilla",
@@ -114,8 +114,10 @@ def _run_frac_ckpt(run_name: str, fraction: float) -> str:
 
 try:
     import budget as B
-except ImportError:  # running from another cwd
-    sys.path.insert(0, str(Path(__file__).resolve().parent)); import budget as B
+except ImportError:  # inside a Modal container this file is /root/modal_app.py; budget.py is in the mounted bench dir
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, "/root/bench")
+    import budget as B
 
 
 def build_matrix(name: str, seeds: List[int], epochs: int | None = None) -> List[List[dict]]:
@@ -143,10 +145,15 @@ def build_matrix(name: str, seeds: List[int], epochs: int | None = None) -> List
             w.append(_cfg("sprkd", f"pilot_{s}_asrinit_from_{t}_s{seed}", model=s, teacher=t, teachers=1, teacher_epochs=1, saddle_steps=100, epochs=E, milestones=[3, 4], seed=seed, init_only=True))
         return [w]
 
-    if name == "control":  # verifies spawn/record/poll/abort/budget-stop/halt for cents; no GPU work
+    if name == "control":  # verifies spawn/record/poll/abort/timeout on real Modal for cents; no GPU work
         return [[_cfg("control", "c_fast", total_steps=60, step_s=1.0),
                  _cfg("control", "c_slow", total_steps=1200, step_s=1.0, report_of=36000),
                  _cfg("control", "c_sleep", total_steps=1200, step_s=1.0)]]
+    if name == "control_long":  # one no-op run with a 1 h timeout: for the halt and watchdog tests
+        return [[_cfg("control", "c_long", total_steps=3000, step_s=1.0, est_h=0.5)]]
+    if name == "probe":  # timing probe on one real S1 checkpoint (see gpu_probe.py)
+        return [[_cfg("probe", "probe_a100_s0_ck050", saddle_dir=f"{VOL}/results/cifar_saddle", teacher="resnet32x4",
+                      seed=0, ckpt="050", probe_size=256, refine_steps=20, hisd_steps=5, num_workers=0)]]
     E = E or 240
     if name == "s0":  # smoke of every cifar_saddle stage on a subset, one container each, sequential waves
         c = dict(subset=2048, teacher="resnet32x4", student="resnet8x4", probe_size=64, out_dir="cifar_saddle_smoke")
@@ -331,7 +338,7 @@ GPU_SMOKE = os.environ.get("SPRKD_GPU_SMOKE", "T4")
 
 
 def gpu_for(cfg: dict, gpu_override: str | None) -> str:
-    g = gpu_override or ("T4" if cfg["runner"] == "control" else GPU_SADDLE if cfg["runner"] == "cifar_saddle" else
+    g = gpu_override or ("T4" if cfg["runner"] == "control" else GPU_SADDLE if cfg["runner"] in ("cifar_saddle", "probe") else
                          GPU_SMOKE if cfg["run_name"].startswith("pilot_") else
                          GPU_IMAGENET if cfg["args"].get("dataset") == "imagenet100" else GPU_DEFAULT)
     if g not in ALLOWED_GPUS:
@@ -344,11 +351,29 @@ def _gpu_for_unchecked(cfg: dict, gpu_override: str | None) -> str:
         return gpu_override
     if cfg["runner"] == "control":
         return "T4"
-    if cfg["runner"] == "cifar_saddle":
+    if cfg["runner"] in ("cifar_saddle", "probe"):
         return GPU_SADDLE
     if cfg["run_name"].startswith("pilot_"):
         return GPU_SMOKE
     return GPU_IMAGENET if cfg["args"].get("dataset") == "imagenet100" else GPU_DEFAULT
+
+
+# Measured on Modal A100-SXM4-40GB, 2026-09-28, run probe_a100_s0_ck050 (resnet32x4, 7.43M params,
+# 256-image probe): results/runs/probe_a100_s0_ck050/probe_timing.json. HiSD per-step includes
+# its eigenvector setup averaged over 5 steps, so it is conservative.
+MEASURED_A100 = {"hvp_s": 0.2425, "adam_step_s": 0.3001, "hisd_step_s": 3.0594, "curvature_s": 97.96, "eval_s": 15.0}
+CONTAINER_START_H = 3 / 60
+
+
+def is_measured(c: dict) -> bool:
+    """Only stage types whose per-step time was measured on the target GPU may launch
+    (see neurips/10_s1_incident.md). Control and probe runs are the measuring tools."""
+    if c["runner"] in ("control", "probe"):
+        return True
+    if c["runner"] == "cifar_saddle":
+        a = c["args"]
+        return a["stage"] == "refine" and a.get("teacher", "resnet32x4") == "resnet32x4" and a.get("probe_size", 256) <= 256
+    return False
 
 
 def run_hours(c: dict, gpu: str | None = None) -> tuple:
@@ -357,14 +382,21 @@ def run_hours(c: dict, gpu: str | None = None) -> tuple:
     speed = GPU_SPEED_VS_A100.get(g, 1.0)
     if c["runner"] == "cifar_saddle":
         st = a["stage"]; ep = a.get("student_epochs", 240)
-        # NOTE: the refine/ridge figures are guesses, not measurements; the S1 launch of 2026-09-28
-        # overran them by more than 10x. Measure one step on the target GPU before trusting them.
-        h = {"teachers": 0.8, "refine": 0.9, "ridge": 1.0, "transplant": 3 * 0.45 * ep / 240}[st] * (0.1 if a.get("subset") else 1.0)
+        if st == "refine":
+            m = MEASURED_A100
+            n_fr = len(str(a.get("fractions", "1.0")).split(","))
+            step_s = m["hisd_step_s"] if a.get("refine_method") == "hisd" else m["adam_step_s"]
+            per_ck = a.get("refine_steps", 2000) * step_s + m["curvature_s"] + m["eval_s"]
+            return g, (CONTAINER_START_H + n_fr * per_ck / 3600) / speed
+        # UNMEASURED guesses (is_measured() refuses these stages until a probe times them)
+        h = {"teachers": 0.8, "ridge": 1.0, "transplant": 3 * 0.45 * ep / 240}[st] * (0.1 if a.get("subset") else 1.0)
         return g, h / speed
     if c["runner"] == "malaria":  # ~8 runs x ~2 min each on A100 for the 6k/25k-param CNNs at 100 epochs
         return g, 0.35 * a.get("epochs", 100) / 100 / speed
     if c["runner"] == "control":
-        return g, 0.1
+        return g, a.get("est_h", 0.1)
+    if c["runner"] == "probe":
+        return g, 0.125
     ds_mult = DATASET_TIME_MULT.get(a.get("dataset", "cifar100"), 1.0)
     h = A100_HOURS_240EP.get(a["model"], 0.5) * a.get("epochs", 240) / 240 * ds_mult
     if c["runner"] == "train" and a.get("mode") == "kd":
@@ -390,7 +422,8 @@ def estimate_cost(configs: List[dict], gpu: str | None = None) -> Dict[str, floa
         worst += run_timeout_s(c, gpu) / 3600 * rate
     usd = sum(h * (GPU_USD_PER_HOUR.get(g, 2.1) + CONTAINER_OVERHEAD_USD_PER_HOUR) for g, h in hours_by_gpu.items())
     return {"runs": len(configs), "gpu_hours": {g: round(h, 1) for g, h in hours_by_gpu.items()},
-            "usd": round(usd, 0), "worst_case_usd": round(worst, 0)}
+            "usd": round(usd, 2), "worst_case_usd": round(worst, 2),
+            "unmeasured": sorted({c["run_name"] for c in configs if not is_measured(c)})}
 
 
 def cfg_to_argv(cfg: dict, data_root: str, out_root: str, ckpt_dir: str) -> List[str]:
@@ -406,6 +439,8 @@ def cfg_to_argv(cfg: dict, data_root: str, out_root: str, ckpt_dir: str) -> List
         if "num_workers" not in cfg["args"]:
             argv += ["--num-workers", "8"]
     for k, v in cfg["args"].items():
+        if k == "est_h":
+            continue
         flag = "--" + k.replace("_", "-")
         if k == "teacher_ckpt":
             if v == "CRD":
@@ -498,7 +533,9 @@ if modal is not None:
         os.chdir(REMOTE_BENCH)
         vol.reload()
         ds = cfg["args"].get("dataset", "cifar100")
-        if cfg["runner"] == "malaria":
+        if cfg["runner"] in ("control", "probe"):
+            pass  # no dataset needed
+        elif cfg["runner"] == "malaria":
             _ensure_malaria()
         elif ds == "cifar100":
             _ensure_cifar(); _ensure_teachers()
@@ -509,15 +546,18 @@ if modal is not None:
         argv = cfg_to_argv(cfg, f"{VOL}/data", out_root, f"{VOL}/checkpoints")
         env = {**os.environ, "PYTHONPATH": f"{REMOTE_PKG_PARENT}:{REMOTE_BENCH}", "SPRKD_REQUIRE_CUDA": "1"}
         t0 = time.time()
-        with open(log_dir / f"{cfg['run_name']}.log", "w") as log:
-            proc = subprocess.run([sys.executable] + argv, cwd=REMOTE_BENCH, env=env, stdout=log, stderr=subprocess.STDOUT)
+        log_name = cfg.get("log_name") or cfg["run_name"]  # per-launch name, so a driver never reads an earlier launch's log
+        with open(log_dir / f"{log_name}.log", "w") as log:
+            proc = subprocess.Popen([sys.executable] + argv, cwd=REMOTE_BENCH, env=env, stdout=log, stderr=subprocess.STDOUT)
+            while proc.poll() is None:  # commit the log every 30 s so the driver (another container) sees heartbeats
+                time.sleep(30); log.flush(); vol.commit()
         vol.commit()
         summary_path = Path(out_root) / cfg["run_name"] / "summary.json"
         result = {"run_name": cfg["run_name"], "returncode": proc.returncode, "wall_clock_s": round(time.time() - t0, 1)}
         if summary_path.is_file():
             result["summary"] = json.load(open(summary_path))
         else:
-            result["log_tail"] = open(log_dir / f"{cfg['run_name']}.log").read()[-3000:]
+            result["log_tail"] = open(log_dir / f"{log_name}.log").read()[-3000:]
             if proc.returncode == 0 and cfg["runner"] == "cifar_saddle":
                 result["summary"] = {"stage": cfg["args"]["stage"], "ok": True}
         return result
@@ -559,6 +599,20 @@ if modal is not None:
                 return rec, path
         return None, None
 
+    def _live_record_client(matrix: str):
+        """Same as _live_record but from a laptop client (vol.reload() only works inside a container)."""
+        try:
+            paths = sorted(e.path for e in vol.listdir("results/launches"))
+        except Exception:
+            return None
+        for path in reversed(paths):
+            if not path.endswith(".json"):
+                continue
+            rec = B.loads(b"".join(vol.read_file(path)).decode())
+            if rec["matrix"] == matrix and rec["status"] == B.LIVE:
+                return rec
+        return None
+
     def _cancel_all(rec: dict, reason: str, log):
         """Cancel every live run (terminating its container) and mark the record."""
         for name in B.live_runs(rec):
@@ -590,10 +644,15 @@ if modal is not None:
         modal.FunctionCall.from_id(call_id).cancel(terminate_containers=True)
 
     def _run_waves_budgeted(waves, configs, gpu, concurrency, log, rec: dict, rec_path: Path):
+        launch_id = rec_path.stem
+
         def spawn(c):
             g = gpu_for(c, gpu or None); tmo = run_timeout_s(c, gpu or None)
-            call = train.with_options(gpu=g, max_containers=concurrency, timeout=tmo).spawn(c)
+            call = train.with_options(gpu=g, max_containers=concurrency, timeout=tmo).spawn({**c, "log_name": f"{launch_id}__{c['run_name']}"})
             return call.object_id, g, tmo
+
+        def read_log(run_name):
+            return _read_run_log(f"{launch_id}__{run_name}")
 
         def save(r):
             _save_record(r, rec_path)
@@ -601,11 +660,12 @@ if modal is not None:
         def sleep(sec):
             time.sleep(sec); vol.reload()
 
-        return B.run_budgeted(waves, rec, spawn=spawn, poll=_poll, cancel=_cancel, read_log=_read_run_log,
+        return B.run_budgeted(waves, rec, spawn=spawn, poll=_poll, cancel=_cancel, read_log=read_log,
                               save=save, log=log, now=time.time, sleep=sleep, poll_s=POLL_S)
 
     @app.function(image=image, volumes={VOL: vol}, timeout=24 * 3600, cpu=1, memory=2048)
-    def sweep_driver(matrix: str, seeds: List[int], gpu: str = "", epochs: int = 0, concurrency: int = 32, budget_usd: float = 0.0) -> str:
+    def sweep_driver(matrix: str, seeds: List[int], gpu: str = "", epochs: int = 0, concurrency: int = 32, budget_usd: float = 0.0,
+                     stale_s: int = 1200) -> str:
         """Run a whole matrix from inside Modal with a runtime budget. Survives the laptop sleeping;
         after a Modal preemption it re-attaches to the runs in its launch record instead of respawning.
         Progress: /vol/results/logs/driver_<matrix>_<ts>.log; record: /vol/results/launches/<matrix>_<ts>.json."""
@@ -619,11 +679,12 @@ if modal is not None:
         if rec is None:
             rec = B.new_record(matrix, budget_usd, TRAIN_CPU, TRAIN_MEM_GIB, driver_call_id=modal.current_function_call_id() or "",
                                note=f"seeds={seeds} gpu={gpu or 'default'} est={estimate_cost(configs, gpu or None)}")
+            rec["stale_s"] = int(stale_s)
             rec_path = LAUNCH_DIR / f"{matrix}_{stamp}.json"
             _save_record(rec, rec_path)
             log_path = log_dir / f"driver_{matrix}_{stamp}.log"
         else:
-            log_path = log_dir / f"driver_{matrix}_{rec_path.stem.split('_', 1)[1]}.log"
+            log_path = log_dir / f"driver_{matrix}_{rec_path.stem[len(matrix) + 1:]}.log"
 
         def log(line: str):
             print(line, flush=True)
@@ -643,7 +704,6 @@ if modal is not None:
     def status(matrix: str = "", lines: int = 25):
         """From any machine with a Modal token: print the newest launch record (accrued cost, per-run
         elapsed/progress/projection) and the tail of its driver log. Touches no GPU."""
-        vol.reload()
         recs = []
         try:
             listing = vol.listdir("results/launches")
@@ -670,7 +730,6 @@ if modal is not None:
     def halt(matrix: str = ""):
         """From any machine with a Modal token: cancel every live run of the newest live launch record
         (terminating containers) and cancel its driver. Idempotent."""
-        vol.reload()
         found = False
         try:
             listing = [x.path for x in vol.listdir("results/launches")]
@@ -706,7 +765,11 @@ if modal is not None:
 
     @app.local_entrypoint()
     def sweep(matrix: str = "pilot", seeds: str = "0,1,2,3,4", gpu: str = "", epochs: int = 0,
-              concurrency: int = 32, dry_run: bool = False, max_cost_usd: float = 0.0, driver: bool = False):
+              concurrency: int = 32, dry_run: bool = False, max_cost_usd: float = 0.0, driver: bool = False,
+              runtime_budget_usd: float = 0.0, stale_s: int = 1200, allow_unmeasured: bool = False):
+        """runtime_budget_usd (optional, <= max_cost_usd): the budget the cloud driver and watchdog enforce while
+        running; defaults to max_cost_usd. stale_s: seconds without a driver heartbeat before the watchdog kills
+        the launch (default 20 min)."""
         seed_list = [int(s) for s in seeds.split(",") if s.strip()]
         print(f"mounted sprkd package: {SPRKD_PKG} ({package_version_info()})")
         if not (SPRKD_PKG / "hessian_utils.py").is_file():
@@ -716,8 +779,8 @@ if modal is not None:
         configs = flatten(waves)
         est = estimate_cost(configs, gpu or None)
         print(f"matrix={matrix} waves={len(waves)} runs={len(configs)} est={est}")
-        existing, _ = (None, None) if dry_run else _live_record(matrix)
-        why = B.launch_refusal(est, max_cost_usd, driver, existing is not None, dry_run)
+        existing = None if dry_run else _live_record_client(matrix)
+        why = B.launch_refusal(est, max_cost_usd, driver, existing is not None, dry_run, allow_unmeasured)
         if why:
             raise SystemExit(why)
         if dry_run:
@@ -726,6 +789,9 @@ if modal is not None:
                 for c in w:
                     print(f"  [{gpu_for(c, gpu or None)}] {c['run_name']}: {' '.join(cfg_to_argv(c, '<data>', '<out>', '<ckpt>'))}")
             return
-        call = sweep_driver.spawn(matrix, seed_list, gpu, epochs, concurrency, max_cost_usd)
-        print(f"driver spawned: call id {call.object_id}; budget ${max_cost_usd}; status: "
+        budget = runtime_budget_usd or max_cost_usd
+        if budget > max_cost_usd:
+            raise SystemExit("--runtime-budget-usd must not exceed --max-cost-usd")
+        call = sweep_driver.spawn(matrix, seed_list, gpu, epochs, concurrency, budget, stale_s)
+        print(f"driver spawned: call id {call.object_id}; runtime budget ${budget}; status: "
               f"`modal run neurips/bench/modal_app.py::status --matrix {matrix}`; stop: `modal run neurips/bench/modal_app.py::halt --matrix {matrix}`")

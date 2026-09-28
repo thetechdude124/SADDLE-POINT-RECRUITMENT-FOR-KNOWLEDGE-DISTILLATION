@@ -140,7 +140,8 @@ def test_driver_budget_stop_cancels_everything():
     assert st == B.BUDGET_STOP and rec["status"] == B.BUDGET_STOP
     assert sorted(fm.cancelled) == ["fc-a", "fc-b"]
     spent = B.accrued_usd(rec, fm.t)
-    assert 1.0 <= spent < 1.0 + 2 * rec["runs"]["a"]["rate_usd_h"] * 30 / 3600 + 1e-9   # overshoot at most one poll interval
+    assert spent <= 1.0                                              # stops before the cap, never after
+    assert spent >= 1.0 - 2 * rec["runs"]["a"]["rate_usd_h"] * (1.5 * 30 + 15 + 30) / 3600   # and not absurdly early
 
 
 def test_driver_aborts_run_projecting_past_timeout():
@@ -205,3 +206,35 @@ def test_launch_refusal():
     assert "live launch record" in B.launch_refusal(est, 50, driver=True, live_record_exists=True)
     assert B.launch_refusal(est, 50, driver=True, live_record_exists=False) is None
     assert B.launch_refusal(est, 0, driver=False, live_record_exists=True, dry_run=True) is None
+
+
+def test_watchdog_respects_per_record_stale_threshold():
+    rec = B.new_record("m", 100.0, 4, 16, now=0.0)
+    B.add_run(rec, "a", "fc-a", "T4", 3600, now=0.0)
+    assert B.watchdog_reasons(rec, now=300.0, stale_s=1200) == []
+    assert any("heartbeat" in x for x in B.watchdog_reasons(rec, now=300.0, stale_s=180))
+
+
+def test_driver_ignores_stale_progress_from_an_earlier_launch():
+    # the log still holds a previous launch's line: 330 steps of 1200 after 331 s (projects 1200 s > 900 s timeout)
+    stale = lambda el: json.dumps({"progress": 330, "of": 1200, "elapsed_s": 331.0})
+    fm = FakeModal({"r": 200}, logs={"r": stale})
+    rec = B.new_record("m", 100.0, 4, 16, now=0.0)
+    fm.run([[_c("r", 900)]], rec)
+    assert rec["runs"]["r"]["status"] == "ok" and fm.cancelled == []
+
+
+def test_budget_stop_never_overshoots_with_slow_polls():
+    # six A100s (the S1 wave-2 shape), budget $5, polls that take 30 s plus 10 s of latency
+    class Slow(FakeModal):
+        def sleep(self, s): self.t += s + 10
+    fm = Slow({f"r{i}": 10**9 for i in range(6)})
+    rec = B.new_record("m", 5.0, 4, 16, now=0.0)
+    assert fm.run([[_c(f"r{i}", 24 * 3600) for i in range(6)]], rec) == B.BUDGET_STOP
+    assert B.accrued_usd(rec, fm.t) <= 5.0
+
+
+def test_launch_refuses_unmeasured_stages():
+    est = {"worst_case_usd": 10.0, "usd": 5.0, "unmeasured": ["gate_scratch_s0"]}
+    assert "no measured step time" in B.launch_refusal(est, 50, driver=True, live_record_exists=False)
+    assert B.launch_refusal(est, 50, driver=True, live_record_exists=False, allow_unmeasured=True) is None
