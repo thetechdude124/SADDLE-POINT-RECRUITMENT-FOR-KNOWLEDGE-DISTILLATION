@@ -25,6 +25,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import os
 import copy
 import json
 import math
@@ -41,6 +42,9 @@ from data import get_loaders
 from models import build_model
 
 HERE = Path(__file__).resolve().parent
+
+
+DEVICE = None  # set in main(); Hessian helpers check the model is on it
 
 
 def parse():
@@ -106,7 +110,11 @@ def probe_batch(train_loader, n, seed=12345):
 
 def curvature(model, batch, k=5):
     from sprkd.hessian_utils import extreme_eigenpairs
-    m = copy.deepcopy(model).cpu()
+    m = copy.deepcopy(model)
+    dev = next(m.parameters()).device
+    if DEVICE is not None and dev.type != DEVICE.type:
+        raise RuntimeError(f"curvature(): model is on {dev}, expected {DEVICE}")
+    batch = (batch[0].to(dev), batch[1].to(dev))
     e = extreme_eigenpairs(m, nn.CrossEntropyLoss(), batch, k=k, tol=1e-2, max_iter=20)
     return {"lambda_max": e["lambda_max"], "lambda_min_k": e["lambda_min_k"], "grad_norm_probe": e["grad_norm"], "n_hvp": e["n_hvp"]}
 
@@ -161,7 +169,7 @@ def stage_teachers(args, device):
 def stage_refine(args, device):
     from sprkd.saddle import refine_to_stationary
     _, test_loader, _ = get_loaders(args.dataset, args.data_root, 64, args.num_workers, 0, args.subset, download=True)
-    probe = torch.load(Path(args.out) / "probe.pt")
+    probe = tuple(t.to(device) for t in torch.load(Path(args.out) / "probe.pt"))
     for seed in [int(s) for s in args.seeds.split(",")]:
         d = Path(args.out) / f"teacher_s{seed}"
         tag = "hisd" if args.refine_method == "hisd" else "ref"
@@ -171,7 +179,7 @@ def stage_refine(args, device):
             key = f"{int(round(f * 100)):03d}"
             if key in done:
                 continue
-            t = build_model(args.teacher, 100); t.load_state_dict(torch.load(d / f"ck_{key}.pt", map_location="cpu"))
+            t = build_model(args.teacher, 100).to(device); t.load_state_dict(torch.load(d / f"ck_{key}.pt", map_location=device))
             th0 = flat(t); t0 = time.time()
             rec = refine_to_stationary(t, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50, hisd_index=args.hisd_index)
             c = curvature(t, probe)
@@ -238,7 +246,7 @@ def tangent(nodes, losses, i):
 def stage_ridge(args, device):
     from sprkd.saddle import refine_to_stationary
     train_loader, test_loader, _ = get_loaders(args.dataset, args.data_root, 64, args.num_workers, 0, args.subset, download=True)
-    probe = torch.load(Path(args.out) / "probe.pt")
+    probe = tuple(t.to(device) for t in torch.load(Path(args.out) / "probe.pt"))
     xs, ys = [], []
     for x, y in train_loader:
         xs.append(x); ys.append(y)
@@ -274,7 +282,7 @@ def stage_ridge(args, device):
         path_test = [fl.loss_loader(v, test_loader, device) for v in nodes]
         m_ci = build_model(args.teacher, 100).to(device); load_flat(m_ci, nodes[ci])
         torch.save(m_ci.state_dict(), Path(args.out) / f"{key}_climb.pt")
-        m_ref = copy.deepcopy(m_ci).cpu(); t1 = time.time()
+        m_ref = copy.deepcopy(m_ci); t1 = time.time()
         rf = refine_to_stationary(m_ref, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50)
         c = curvature(m_ref, probe); ev = evaluate(copy.deepcopy(m_ref).to(device), test_loader, device)
         torch.save(m_ref.state_dict(), Path(args.out) / f"{key}_refined.pt")
@@ -329,6 +337,10 @@ def stage_transplant(args, device):
 def main():
     args = parse()
     device = get_device(args.device)
+    if os.environ.get("SPRKD_REQUIRE_CUDA") == "1" and device.type != "cuda":
+        raise SystemExit(f"SPRKD_REQUIRE_CUDA is set but the device is {device}; refusing to run Hessian work off the GPU")
+    global DEVICE
+    DEVICE = device
     Path(args.out).mkdir(parents=True, exist_ok=True)
     {"teachers": stage_teachers, "refine": stage_refine, "ridge": stage_ridge, "transplant": stage_transplant}[args.stage](args, device)
 
