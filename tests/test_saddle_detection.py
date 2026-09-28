@@ -132,3 +132,26 @@ def test_refine_alternative_solvers_reach_the_quadratic_saddle(method):
     r = refine_to_stationary(m, _MeanLoss(), BATCH, max_steps=3000, grad_tol=1e-4, lr=0.05, method=method, solver_iters=20)
     assert r["grad_norm_after"] <= 1e-3 * 5 or r["converged"]
     assert m.w.detach().abs().max() < 0.05
+
+
+def test_hisd_finds_index1_and_index2_saddles():
+    torch.manual_seed(0)
+    m = _Quadratic([0.5, 0.3, 0.2, 0.3, 0.4])
+    # DIAG has two negative directions (-0.5, -2): index-1 dynamics cannot converge there, index-2 can
+    r2 = refine_to_stationary(m, _MeanLoss(), BATCH, max_steps=1500, grad_tol=1e-5, lr=0.2, method="hisd", hisd_index=2)
+    assert r2["converged"] and m.w.detach().abs().max() < 1e-3
+    assert sorted(round(v, 2) for v in r2["lambda_track"]) == [-2.0, -0.5]
+
+    class DoubleWell(nn.Module):  # minima at x = +-1, index-1 saddle at x = 0; stiff in the other coordinates
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.tensor([0.95, 0.2, -0.1, 0.1, 0.05]))
+
+        def forward(self, x):
+            return ((self.w[0] ** 2 - 1) ** 2 + 5.0 * (self.w[1:] ** 2).sum()).expand(x.shape[0], 1)
+
+    torch.manual_seed(0)
+    dw = DoubleWell()
+    r1 = refine_to_stationary(dw, _MeanLoss(), BATCH, max_steps=2000, grad_tol=1e-5, lr=0.05, method="hisd", hisd_index=1)
+    assert r1["converged"] and dw.w.detach().abs().max() < 1e-3   # climbed from the minimum to the saddle at 0
+    assert abs(r1["lambda_track"][0] + 4.0) < 0.05
