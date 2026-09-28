@@ -31,7 +31,9 @@ first, then everything that needs their checkpoints).
 `--gpu` selects the accelerator for the whole sweep. Policy: T4 only (default); A10G is
 accepted as the fallback if T4 is not offered; anything else is refused.
 `--concurrency` caps simultaneous containers (default 32). `--max-cost-usd N` refuses to
-launch when the estimator's cost exceeds N.
+launch when the estimator's cost exceeds N. `--driver` runs the wave loop inside a Modal CPU
+function (use with `--detach`), so the launch survives the laptop sleeping; progress is
+written to the volume under results/logs/driver_<matrix>_*.log.
 
 This module imports without a Modal login or network access: Modal objects are created
 lazily; `build_matrix`, `estimate_cost` and `cfg_to_argv` are pure functions with tests.
@@ -499,9 +501,49 @@ if modal is not None:
         vol.commit()
         print("done:", root)
 
+    def _run_waves(waves, configs, gpu, concurrency, log):
+        """Wave loop shared by the local entrypoint and the cloud driver."""
+        total_done = 0
+        for wi, w in enumerate(waves):
+            groups: Dict[str, List[dict]] = {}
+            for c in w:
+                groups.setdefault(gpu_for(c, gpu or None), []).append(c)
+            log(f"=== wave {wi + 1}/{len(waves)}: {len(w)} runs across GPUs {sorted(groups)}")
+            for g, cfgs in groups.items():
+                fn = train.with_options(gpu=g, max_containers=concurrency)
+                for r in fn.map(cfgs, order_outputs=False, return_exceptions=True):
+                    total_done += 1
+                    if isinstance(r, Exception):
+                        log(f"[{total_done}/{len(configs)}] EXCEPTION {r!r}"); continue
+                    if r.get("error"):
+                        log(f"[{total_done}/{len(configs)}] {r['run_name']} FAILED\n{r['error'][-1500:]}"); continue
+                    s_ = r.get("summary", {})
+                    log(f"[{total_done}/{len(configs)}] {r['run_name']} rc={r['returncode']} final_top1={s_.get('final_test_top1')} "
+                        f"best={s_.get('best_test_top1')} wall={r['wall_clock_s']}s" + ("" if s_ else f"\n{r.get('log_tail', '')[-800:]}"))
+        log("done.")
+
+    @app.function(image=image, volumes={VOL: vol}, timeout=24 * 3600, cpu=2, memory=4096)
+    def sweep_driver(matrix: str, seeds: List[int], gpu: str = "", epochs: int = 0, concurrency: int = 32) -> str:
+        """Run a whole matrix from inside Modal so the laptop client is not needed after launch.
+        Progress goes to /vol/results/logs/driver_<matrix>_<timestamp>.log (committed after every line)."""
+        waves = build_matrix(matrix, seeds, epochs or None)
+        configs = flatten(waves)
+        log_dir = Path(VOL) / "results" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"driver_{matrix}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+
+        def log(line: str):
+            print(line, flush=True)
+            with open(log_path, "a") as f:
+                f.write(line + "\n")
+            vol.commit()
+
+        log(f"driver start matrix={matrix} seeds={seeds} runs={len(configs)} est={estimate_cost(configs, gpu or None)}")
+        _run_waves(waves, configs, gpu, concurrency, log)
+        return str(log_path)
+
     @app.local_entrypoint()
     def sweep(matrix: str = "pilot", seeds: str = "0,1,2,3,4", gpu: str = "", epochs: int = 0,
-              concurrency: int = 32, dry_run: bool = False, max_cost_usd: float = 0.0):
+              concurrency: int = 32, dry_run: bool = False, max_cost_usd: float = 0.0, driver: bool = False):
         seed_list = [int(s) for s in seeds.split(",") if s.strip()]
         print(f"mounted sprkd package: {SPRKD_PKG} ({package_version_info()})")
         if not (SPRKD_PKG / "hessian_utils.py").is_file():
@@ -519,22 +561,10 @@ if modal is not None:
                 for c in w:
                     print(f"  [{gpu_for(c, gpu or None)}] {c['run_name']}: {' '.join(cfg_to_argv(c, '<data>', '<out>', '<ckpt>'))}")
             return
-        total_done = 0
-        for wi, w in enumerate(waves):
-            groups: Dict[str, List[dict]] = {}
-            for c in w:
-                groups.setdefault(gpu_for(c, gpu or None), []).append(c)
-            print(f"=== wave {wi + 1}/{len(waves)}: {len(w)} runs across GPUs {sorted(groups)}")
-            for g, cfgs in groups.items():
-                fn = train.with_options(gpu=g, max_containers=concurrency)
-                for r in fn.map(cfgs, order_outputs=False, return_exceptions=True):
-                    total_done += 1
-                    if isinstance(r, Exception):
-                        print(f"[{total_done}/{len(configs)}] EXCEPTION {r!r}"); continue
-                    if r.get("error"):
-                        print(f"[{total_done}/{len(configs)}] {r['run_name']} FAILED\n{r['error'][-1500:]}"); continue
-                    s = r.get("summary", {})
-                    print(f"[{total_done}/{len(configs)}] {r['run_name']} rc={r['returncode']} final_top1={s.get('final_test_top1')} "
-                          f"best={s.get('best_test_top1')} wall={r['wall_clock_s']}s"
-                          + ("" if s else f"\n{r.get('log_tail', '')[-800:]}"))
-        print("done. Fetch results: modal volume get sprkd-bench results/runs neurips/bench/results/modal_runs")
+        if driver:
+            call = sweep_driver.spawn(matrix, seed_list, gpu, epochs, concurrency)
+            print(f"driver spawned: call id {call.object_id}; progress in the volume under results/logs/driver_{matrix}_*.log "
+                  f"(modal volume ls sprkd-bench results/logs). Run with --detach so the driver outlives this client.")
+            return
+        _run_waves(waves, configs, gpu, concurrency, print)
+        print("Fetch results: modal volume get sprkd-bench results/runs neurips/bench/results/modal_runs")
