@@ -308,6 +308,7 @@ def refine_to_stationary(
     solver_iters: int = 30,
     verbose: bool = False,
     lm_damping: float = 1e-2,
+    hisd_index: int = 1,
 ) -> dict:
     """Move ``model`` (in place) from a candidate snapshot toward a stationary point of the
     probe-batch loss by minimising ``0.5 * ||grad L||^2``.
@@ -320,7 +321,11 @@ def refine_to_stationary(
     ``mu`` by 4x. This is the standard trust-region-like solver for stationary points and
     converges to saddles as readily as to minima. ``method="adam"``: first-order Adam on
     ``0.5 ||grad L||^2`` (one HVP per step, robust on piecewise-linear ReLU landscapes where
-    Newton-type steps stall at kinks). ``method="gn"``: Newton step via MINRES:
+    Newton-type steps stall at kinks). ``method="hisd"``: index-1 high-index saddle
+    dynamics (gentlest-ascent-type flow: ascend along the tracked most-negative eigenvector,
+    descend in all other directions), which walks from a minimum up to the nearest index-1
+    saddle rather than to whatever stationary point is closest. ``method="gn"``: Newton step
+    via MINRES:
     solve ``H d = g`` with MINRES (matrix-free, indefinite ``H`` allowed), then a
     backtracking line search on the gradient norm; if no step length reduces it, fall back
     to one gradient-norm-descent step ``theta -= lr * H g``. ``method="gradnorm"``: only
@@ -362,6 +367,42 @@ def refine_to_stationary(
             g = op.grad_flat
             theta = flat_params()
             moved = False
+            if method == "hisd":
+                # index-k high-index saddle dynamics (Yin, Zhang & Zhang 2019): descend in all directions but
+                # ascend along the k tracked most-negative eigenvectors V (n x k, orthonormal); V is refined
+                # by block shifted power iteration on (H - lambda_max I) so it stays at the negative end.
+                # Direction: -(I - 2 V V^T) g. From a minimum, index-1 HiSD climbs the softest mode to the
+                # nearest index-1 saddle; at an index-j saddle only k >= j converges.
+                from sprkd.hessian_utils import _power_iteration
+                st = rec.setdefault("_hisd", {})
+                k = int(hisd_index)
+                if "V" not in st:
+                    lam_dom, _ = _power_iteration(op.hvp, op.n, g.device, g.dtype, 30, 1e-2)
+                    st["lam_dom"] = lam_dom
+                    V = torch.randn(op.n, k, device=g.device, dtype=g.dtype)
+                    V, _ = torch.linalg.qr(V)
+                    for _ in range(40):
+                        W = torch.stack([op.hvp(V[:, j]) - lam_dom * V[:, j] for j in range(k)], dim=1)
+                        V, _ = torch.linalg.qr(W)
+                    st["V"] = V
+                    rec["n_hvp"] += op.n_hvp; op.n_hvp = 0
+                V = st["V"]
+                for _ in range(3):  # keep tracking the negative end as the point moves
+                    HV = torch.stack([op.hvp(V[:, j]) for j in range(k)], dim=1)
+                    st["lam_track"] = [float(torch.dot(V[:, j], HV[:, j])) for j in range(k)]
+                    V, _ = torch.linalg.qr(HV - st["lam_dom"] * V)
+                st["V"] = V
+                direction = -(g - 2.0 * V @ (V.T @ g))
+                step_vec = lr * direction; sn = float(step_vec.norm())
+                if sn > 1.0:
+                    step_vec = step_vec / sn
+                set_params(theta + step_vec)
+                rec["n_hvp"] += op.n_hvp
+                op.release(); op = HessianOperator(m, loss_fn, b)
+                g_norm = float(op.grad_flat.norm()); rec["steps"] = step + 1
+                rec["best_grad_norm"] = min(rec.get("best_grad_norm", g_norm), g_norm)
+                rec["lambda_track"] = st["lam_track"]
+                continue
             if method == "adam":
                 # first-order minimisation of 0.5||g||^2 with Adam on the flat parameters; one HVP per step
                 st = rec.setdefault("_adam", {"m": torch.zeros_like(g), "v": torch.zeros_like(g), "t": 0})
@@ -450,6 +491,6 @@ def refine_to_stationary(
         rec["grad_norm_after"] = g_norm; rec["loss_after"] = float(op.loss.detach())
         rec["n_hvp"] += op.n_hvp
         op.release()
-    rec.pop("_mu", None); rec.pop("_adam", None)
+    rec.pop("_mu", None); rec.pop("_adam", None); rec.pop("_hisd", None)
     rec["wall_clock_s"] = round(time.time() - t0, 3)
     return rec

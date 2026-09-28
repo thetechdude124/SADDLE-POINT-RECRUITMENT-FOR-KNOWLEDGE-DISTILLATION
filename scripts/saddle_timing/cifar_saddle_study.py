@@ -55,7 +55,8 @@ def parse():
     p.add_argument("--teacher-epochs", type=int, default=10)
     p.add_argument("--fractions", default="0.02,0.05,0.1,0.2,0.35,0.5,0.65,0.8,1.0")
     p.add_argument("--probe-size", type=int, default=256)
-    p.add_argument("--refine-method", default="adam", choices=["adam", "lm", "gn", "gradnorm"])
+    p.add_argument("--refine-method", default="adam", choices=["adam", "lm", "gn", "gradnorm", "hisd"])
+    p.add_argument("--hisd-index", type=int, default=1)
     p.add_argument("--refine-steps", type=int, default=2000)
     p.add_argument("--refine-lr", type=float, default=1e-3)
     p.add_argument("--refine-grad-tol", type=float, default=1e-2)
@@ -66,7 +67,7 @@ def parse():
     p.add_argument("--climb-iters", type=int, default=200)
     p.add_argument("--neb-lr", type=float, default=0.01)
     p.add_argument("--max-step", type=float, default=0.5)
-    p.add_argument("--point", default=None, help="transplant source: ridge:A:B | ck:SEED:FRAC | ref:SEED:FRAC | final:SEED")
+    p.add_argument("--point", default=None, help="transplant source: ridge:A:B | ck:SEED:FRAC | ref:SEED:FRAC | hisd:SEED:FRAC | final:SEED")
     p.add_argument("--student-seeds", default="0,1,2")
     p.add_argument("--student-epochs", type=int, default=240)
     p.add_argument("--milestones", type=int, nargs="*", default=[150, 180, 210])
@@ -129,6 +130,7 @@ def train_teacher_with_ckpts(args, seed, train_loader, test_loader, device, out)
             if step in ck_steps:
                 torch.save(t.state_dict(), d / f"ck_{int(round(ck_steps[step] * 100)):03d}.pt")
                 ev = evaluate(t, test_loader, device)
+                t.train()   # evaluate() switches to eval mode; training must continue with BatchNorm in train mode
                 recs.append({"fraction": ck_steps[step], "step": step, "test_top1": ev["top1"], "test_loss": ev["loss"], "elapsed_s": round(time.time() - t0, 1)})
                 print(json.dumps({"seed": seed, **recs[-1]}), flush=True)
     json.dump({"seed": seed, "steps_total": total, "records": recs}, open(d / "checkpoints.json", "w"), indent=2)
@@ -162,20 +164,22 @@ def stage_refine(args, device):
     probe = torch.load(Path(args.out) / "probe.pt")
     for seed in [int(s) for s in args.seeds.split(",")]:
         d = Path(args.out) / f"teacher_s{seed}"
-        done = json.load(open(d / "refined.json")) if (d / "refined.json").is_file() else {}
+        tag = "hisd" if args.refine_method == "hisd" else "ref"
+        out_json = d / ("hisd.json" if tag == "hisd" else "refined.json")
+        done = json.load(open(out_json)) if out_json.is_file() else {}
         for f in [float(x) for x in args.fractions.split(",")]:
             key = f"{int(round(f * 100)):03d}"
             if key in done:
                 continue
             t = build_model(args.teacher, 100); t.load_state_dict(torch.load(d / f"ck_{key}.pt", map_location="cpu"))
             th0 = flat(t); t0 = time.time()
-            rec = refine_to_stationary(t, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50)
+            rec = refine_to_stationary(t, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50, hisd_index=args.hisd_index)
             c = curvature(t, probe)
             ev = evaluate(copy.deepcopy(t).to(device), test_loader, device)
             cls = ("converged_saddle" if c["lambda_min_k"][0] < -0.1 else "converged_minimum_or_flat") if rec["converged"] else ("unconverged_negcurv" if c["lambda_min_k"][0] < 0 else "unconverged")
             done[key] = {"fraction": f, "refine": rec, **c, "test": ev, "dist_rel": float((flat(t) - th0).norm() / th0.norm()), "class": cls, "wall_s": round(time.time() - t0, 1)}
-            torch.save(t.state_dict(), d / f"ref_{key}.pt")
-            json.dump(done, open(d / "refined.json", "w"), indent=2)
+            torch.save(t.state_dict(), d / f"{tag}_{key}.pt")
+            json.dump(done, open(out_json, "w"), indent=2)
             print(json.dumps({"seed": seed, "fraction": f, "gn": (round(rec["grad_norm_before"], 4), round(rec["grad_norm_after"], 5)), "loss": (round(rec["loss_before"], 4), round(rec["loss_after"], 4)), "test_top1": round(ev["top1"], 2), "lmin": round(c["lambda_min_k"][0], 4), "class": cls, "s": done[key]["wall_s"]}), flush=True)
 
 
@@ -291,7 +295,7 @@ def stage_transplant(args, device):
         src_state = torch.load(out / f"pair_{rest[0]}_{rest[1]}_refined.pt", map_location=device); name = f"ridge_{rest[0]}_{rest[1]}"
     elif kind == "climb":
         src_state = torch.load(out / f"pair_{rest[0]}_{rest[1]}_climb.pt", map_location=device); name = f"climb_{rest[0]}_{rest[1]}"
-    elif kind in ("ck", "ref"):
+    elif kind in ("ck", "ref", "hisd"):
         src_state = torch.load(out / f"teacher_s{rest[0]}" / f"{kind}_{int(round(float(rest[1]) * 100)):03d}.pt", map_location=device); name = f"{kind}_s{rest[0]}_f{int(round(float(rest[1]) * 100)):03d}"
     elif kind == "final":
         src_state = torch.load(out / f"teacher_s{rest[0]}" / "ck_100.pt", map_location=device); name = f"final_s{rest[0]}"
