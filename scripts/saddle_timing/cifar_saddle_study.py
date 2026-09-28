@@ -166,6 +166,14 @@ def stage_teachers(args, device):
         json.dump(rows, open(d / "metrics.json", "w"), indent=2)
 
 
+def _heartbeat(done, total, t0, every_s=[0.0]):
+    """Print a progress line at most every 60 s: the driver reads it to project wall-clock."""
+    now = time.time()
+    if now - every_s[0] >= 60 or done >= total:
+        every_s[0] = now
+        print(json.dumps({"progress": int(done), "of": int(total), "elapsed_s": round(now - t0, 1)}), flush=True)
+
+
 def stage_refine(args, device):
     from sprkd.saddle import refine_to_stationary
     _, test_loader, _ = get_loaders(args.dataset, args.data_root, 64, args.num_workers, 0, args.subset, download=True)
@@ -175,13 +183,16 @@ def stage_refine(args, device):
         tag = "hisd" if args.refine_method == "hisd" else "ref"
         out_json = d / ("hisd.json" if tag == "hisd" else "refined.json")
         done = json.load(open(out_json)) if out_json.is_file() else {}
-        for f in [float(x) for x in args.fractions.split(",")]:
+        fr_all = [float(x) for x in args.fractions.split(",")]
+        total_steps = len(fr_all) * args.refine_steps; t_stage = time.time()
+        for fi, f in enumerate(fr_all):
             key = f"{int(round(f * 100)):03d}"
             if key in done:
                 continue
+            cb = lambda step, gn, el, _fi=fi: _heartbeat(_fi * args.refine_steps + step, total_steps, t_stage)
             t = build_model(args.teacher, 100).to(device); t.load_state_dict(torch.load(d / f"ck_{key}.pt", map_location=device))
             th0 = flat(t); t0 = time.time()
-            rec = refine_to_stationary(t, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50, hisd_index=args.hisd_index)
+            rec = refine_to_stationary(t, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, progress_cb=cb, solver_iters=50, hisd_index=args.hisd_index)
             c = curvature(t, probe)
             ev = evaluate(copy.deepcopy(t).to(device), test_loader, device)
             cls = ("converged_saddle" if c["lambda_min_k"][0] < -0.1 else "converged_minimum_or_flat") if rec["converged"] else ("unconverged_negcurv" if c["lambda_min_k"][0] < 0 else "unconverged")
@@ -254,7 +265,8 @@ def stage_ridge(args, device):
     x_neb, y_neb = torch.cat(xs)[:args.neb_images].to(device), torch.cat(ys)[:args.neb_images].to(device)
     out_f = Path(args.out) / "ridge.json"
     done = json.load(open(out_f)) if out_f.is_file() else {}
-    for pair in args.pairs.split(","):
+    pair_list = args.pairs.split(","); n_pairs = len(pair_list); t_stage = time.time()
+    for pi, pair in enumerate(pair_list):
         sa, sb = [int(v) for v in pair.split(":")]; key = f"pair_{sa}_{sb}"
         if key in done: continue
         t0 = time.time()
@@ -265,6 +277,7 @@ def stage_ridge(args, device):
         lin = [fl.loss_loader(a + float(t) * (b - a), test_loader, device) for t in torch.linspace(0, 1, 6)]
         hist = []
         for it in range(args.string_iters):
+            _heartbeat(pi * (args.string_iters + args.climb_iters) + it, n_pairs * (args.string_iters + args.climb_iters), t_stage)
             lg = [fl.loss_and_grad(v) for v in nodes]; losses = [l for l, _ in lg]
             if any(math.isnan(l) for l in losses): raise RuntimeError("string diverged")
             for i in range(1, K + 1):
@@ -275,6 +288,7 @@ def stage_ridge(args, device):
             if it % 25 == 0: hist.append({"phase": "string", "iter": it, "losses": [round(l, 4) for l in losses]}); print(json.dumps({key: hist[-1]}), flush=True)
         losses = [fl.loss_and_grad(v)[0] for v in nodes]; ci = max(range(1, K + 1), key=lambda j: losses[j])
         for it in range(args.climb_iters):
+            _heartbeat(pi * (args.string_iters + args.climb_iters) + args.string_iters + it, n_pairs * (args.string_iters + args.climb_iters), t_stage)
             losses = [fl.loss_and_grad(v)[0] for v in nodes]; l, g = fl.loss_and_grad(nodes[ci]); tau = tangent(nodes, losses, ci)
             step = args.neb_lr * (g - 2.0 * torch.dot(g, tau) * tau); sn = float(step.norm())
             nodes[ci] = nodes[ci] - (step * (args.max_step / sn) if sn > args.max_step else step)
@@ -310,7 +324,8 @@ def stage_transplant(args, device):
     else:
         raise ValueError(args.point)
     train_loader, test_loader, _ = get_loaders(args.dataset, args.data_root, 64, args.num_workers, 0, args.subset, download=True)
-    for ss in [int(s) for s in args.student_seeds.split(",")]:
+    ss_list = [int(s) for s in args.student_seeds.split(",")]; t_stage = time.time()
+    for si, ss in enumerate(ss_list):
         run_dir = out / "transplant" / f"{args.student}_{name}_s{ss}"
         if (run_dir / "summary.json").is_file():
             print(f"skip {run_dir.name}"); continue
@@ -322,6 +337,7 @@ def stage_transplant(args, device):
         opt = make_sgd(student.parameters(), args.lr); sched = make_multistep(opt, args.milestones)
         best = -1.0; ep_thr = None
         for epoch in range(1, args.student_epochs + 1):
+            _heartbeat(si * args.student_epochs + epoch - 1, len(ss_list) * args.student_epochs, t_stage)
             student.train(); ls = n = 0
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)

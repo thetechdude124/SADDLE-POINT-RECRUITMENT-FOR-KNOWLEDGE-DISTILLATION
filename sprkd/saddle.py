@@ -309,6 +309,7 @@ def refine_to_stationary(
     verbose: bool = False,
     lm_damping: float = 1e-2,
     hisd_index: int = 1,
+    progress_cb=None,
 ) -> dict:
     """Move ``model`` (in place) from a candidate snapshot toward a stationary point of the
     probe-batch loss by minimising ``0.5 * ||grad L||^2``.
@@ -333,6 +334,10 @@ def refine_to_stationary(
     norm is at most ``grad_tol`` or after ``max_steps``.
 
     The stationary point is that of the loss on ``batch``, not of the full training loss.
+
+    ``progress_cb(step, grad_norm, elapsed_s)``, if given, is called after every step so a
+    long refinement can report progress (long runs with no output are how the 2026-09-28
+    Modal overrun went unnoticed).
 
     Returns a dict with ``grad_norm_before``, ``grad_norm_after``, ``loss_before``,
     ``loss_after``, ``steps``, ``n_hvp``, ``converged``, ``wall_clock_s``.
@@ -361,6 +366,8 @@ def refine_to_stationary(
         rec["loss_before"] = float(op.loss.detach()); rec["grad_norm_before"] = float(op.grad_flat.norm())
         g_norm = rec["grad_norm_before"]
         for step in range(max_steps):
+            if progress_cb is not None and step > 0:
+                progress_cb(step, g_norm, time.time() - t0)
             if g_norm <= grad_tol:
                 rec["converged"] = True
                 break
@@ -487,6 +494,8 @@ def refine_to_stationary(
             rec["steps"] = step + 1
             if verbose:
                 print(f"refine step {step + 1}: grad_norm={g_norm:.4g} loss={float(op.loss.detach()):.4f}")
+        if progress_cb is not None:
+            progress_cb(rec["steps"], g_norm, time.time() - t0)
         rec["converged"] = rec["converged"] or g_norm <= grad_tol
         rec["grad_norm_after"] = g_norm; rec["loss_after"] = float(op.loss.detach())
         rec["n_hvp"] += op.n_hvp
