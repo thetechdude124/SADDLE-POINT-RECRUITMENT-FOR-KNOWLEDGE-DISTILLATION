@@ -130,6 +130,7 @@ def train_teacher_with_ckpts(args, seed, train_loader, test_loader, device, out)
             if step in ck_steps:
                 torch.save(t.state_dict(), d / f"ck_{int(round(ck_steps[step] * 100)):03d}.pt")
                 ev = evaluate(t, test_loader, device)
+                t.train()   # evaluate() switches to eval mode; training must continue with BatchNorm in train mode
                 recs.append({"fraction": ck_steps[step], "step": step, "test_top1": ev["top1"], "test_loss": ev["loss"], "elapsed_s": round(time.time() - t0, 1)})
                 print(json.dumps({"seed": seed, **recs[-1]}), flush=True)
     json.dump({"seed": seed, "steps_total": total, "records": recs}, open(d / "checkpoints.json", "w"), indent=2)
