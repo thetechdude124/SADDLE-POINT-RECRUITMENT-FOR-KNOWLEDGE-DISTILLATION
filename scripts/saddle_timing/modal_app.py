@@ -44,6 +44,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import io
 import subprocess
 import sys
 import time
@@ -68,7 +69,7 @@ GPU_USD_PER_HOUR = {"H100": 3.95, "A100-80GB": 2.50, "A100": 2.10, "A10G": 1.10,
 GPU_SPEED_VS_A100 = {"H100": 1.6, "A100-80GB": 1.05, "A100": 1.0, "A10G": 0.45, "L4": 0.35, "T4": 0.2}
 # CPU and memory are billed on top of the GPU: train() asks for 8 cores and 32 GiB, roughly
 # 8 x $0.047 + 32 x $0.008 per hour at Modal list prices (approximate).
-CONTAINER_OVERHEAD_USD_PER_HOUR = 0.63
+CONTAINER_OVERHEAD_USD_PER_HOUR = 4 * 0.0000131 * 3600 + 16 * 0.00000222 * 3600  # 4 cores + 16 GiB, ~$0.32/h
 # Every GPU run gets a hard Modal timeout of TIMEOUT_FACTOR x its estimated hours (clamped), so
 # the worst-case bill of a launch is bounded by TIMEOUT_FACTOR x the estimate, and the launch is
 # refused if that worst case exceeds --max-cost-usd.
@@ -85,7 +86,7 @@ DATASET_TIME_MULT = {"cifar100": 1.0, "tinyimagenet": 2.0, "imagenet100": 4.0}
 
 PAIRS = [("resnet32x4", "resnet8x4"), ("wrn40_2", "wrn16_2"), ("vgg13", "vgg8"), ("resnet110", "resnet20")]
 SMALL_TEACHER_PAIRS = [("resnet20", "resnet8x4"), ("wrn16_2", "wrn40_2")]
-RUNNER_SCRIPTS = {"train": "train.py", "sprkd": "sprkd_runner.py", "malaria": "malaria_e1.py", "cifar_saddle": "cifar_saddle_study.py"}
+RUNNER_SCRIPTS = {"train": "train.py", "sprkd": "sprkd_runner.py", "malaria": "malaria_e1.py", "cifar_saddle": "cifar_saddle_study.py", "control": "control_run.py"}
 GPU_SADDLE = os.environ.get("SPRKD_GPU_SADDLE", "A100")
 MALARIA_URL = "https://data.lhncbc.nlm.nih.gov/public/Malaria/cell_images.zip"
 CRD_TEACHER_FILES = {"resnet32x4": "resnet32x4_vanilla", "wrn40_2": "wrn_40_2_vanilla",
@@ -109,6 +110,12 @@ def _run_ckpt(run_name: str) -> str:
 def _run_frac_ckpt(run_name: str, fraction: float) -> str:
     """A fractional checkpoint (ck_fXXX.pt) saved by train.py --ckpt-fractions."""
     return f"RUNCK:{run_name}:{int(round(fraction * 100)):03d}"
+
+
+try:
+    import budget as B
+except ImportError:  # running from another cwd
+    sys.path.insert(0, str(Path(__file__).resolve().parent)); import budget as B
 
 
 def build_matrix(name: str, seeds: List[int], epochs: int | None = None) -> List[List[dict]]:
@@ -136,6 +143,10 @@ def build_matrix(name: str, seeds: List[int], epochs: int | None = None) -> List
             w.append(_cfg("sprkd", f"pilot_{s}_asrinit_from_{t}_s{seed}", model=s, teacher=t, teachers=1, teacher_epochs=1, saddle_steps=100, epochs=E, milestones=[3, 4], seed=seed, init_only=True))
         return [w]
 
+    if name == "control":  # verifies spawn/record/poll/abort/budget-stop/halt for cents; no GPU work
+        return [[_cfg("control", "c_fast", total_steps=60, step_s=1.0),
+                 _cfg("control", "c_slow", total_steps=1200, step_s=1.0, report_of=36000),
+                 _cfg("control", "c_sleep", total_steps=1200, step_s=1.0)]]
     E = E or 240
     if name == "s0":  # smoke of every cifar_saddle stage on a subset, one container each, sequential waves
         c = dict(subset=2048, teacher="resnet32x4", student="resnet8x4", probe_size=64, out_dir="cifar_saddle_smoke")
@@ -320,7 +331,7 @@ GPU_SMOKE = os.environ.get("SPRKD_GPU_SMOKE", "T4")
 
 
 def gpu_for(cfg: dict, gpu_override: str | None) -> str:
-    g = gpu_override or (GPU_SADDLE if cfg["runner"] == "cifar_saddle" else
+    g = gpu_override or ("T4" if cfg["runner"] == "control" else GPU_SADDLE if cfg["runner"] == "cifar_saddle" else
                          GPU_SMOKE if cfg["run_name"].startswith("pilot_") else
                          GPU_IMAGENET if cfg["args"].get("dataset") == "imagenet100" else GPU_DEFAULT)
     if g not in ALLOWED_GPUS:
@@ -331,6 +342,8 @@ def gpu_for(cfg: dict, gpu_override: str | None) -> str:
 def _gpu_for_unchecked(cfg: dict, gpu_override: str | None) -> str:
     if gpu_override:
         return gpu_override
+    if cfg["runner"] == "control":
+        return "T4"
     if cfg["runner"] == "cifar_saddle":
         return GPU_SADDLE
     if cfg["run_name"].startswith("pilot_"):
@@ -350,6 +363,8 @@ def run_hours(c: dict, gpu: str | None = None) -> tuple:
         return g, h / speed
     if c["runner"] == "malaria":  # ~8 runs x ~2 min each on A100 for the 6k/25k-param CNNs at 100 epochs
         return g, 0.35 * a.get("epochs", 100) / 100 / speed
+    if c["runner"] == "control":
+        return g, 0.1
     ds_mult = DATASET_TIME_MULT.get(a.get("dataset", "cifar100"), 1.0)
     h = A100_HOURS_240EP.get(a["model"], 0.5) * a.get("epochs", 240) / 240 * ds_mult
     if c["runner"] == "train" and a.get("mode") == "kd":
@@ -467,7 +482,9 @@ if modal is not None:
         if changed:
             vol.commit()
 
-    @app.function(image=image, gpu=GPU_DEFAULT, volumes={VOL: vol}, timeout=24 * 3600, cpu=8, memory=32768)
+    TRAIN_CPU, TRAIN_MEM_GIB = 4, 16
+
+    @app.function(image=image, gpu=GPU_DEFAULT, volumes={VOL: vol}, timeout=24 * 3600, cpu=TRAIN_CPU, memory=TRAIN_MEM_GIB * 1024)
     def train(cfg: dict) -> dict:
         """Run one config on a GPU. Returns the run's summary.json (plus a log tail on failure)."""
         import traceback
@@ -523,35 +540,90 @@ if modal is not None:
         vol.commit()
         print("done:", root)
 
-    def _run_waves(waves, configs, gpu, concurrency, log):
-        """Wave loop shared by the local entrypoint and the cloud driver."""
-        total_done = 0
-        for wi, w in enumerate(waves):
-            groups: Dict[tuple, List[dict]] = {}
-            for c in w:
-                groups.setdefault((gpu_for(c, gpu or None), run_timeout_s(c, gpu or None)), []).append(c)
-            log(f"=== wave {wi + 1}/{len(waves)}: {len(w)} runs, (gpu, hard timeout s): {sorted(groups)}")
-            for (g, tmo), cfgs in groups.items():
-                fn = train.with_options(gpu=g, max_containers=concurrency, timeout=tmo)
-                for r in fn.map(cfgs, order_outputs=False, return_exceptions=True):
-                    total_done += 1
-                    if isinstance(r, Exception):
-                        log(f"[{total_done}/{len(configs)}] EXCEPTION {r!r}"); continue
-                    if r.get("error"):
-                        log(f"[{total_done}/{len(configs)}] {r['run_name']} FAILED\n{r['error'][-1500:]}"); continue
-                    s_ = r.get("summary", {})
-                    log(f"[{total_done}/{len(configs)}] {r['run_name']} rc={r['returncode']} final_top1={s_.get('final_test_top1')} "
-                        f"best={s_.get('best_test_top1')} wall={r['wall_clock_s']}s" + ("" if s_ else f"\n{r.get('log_tail', '')[-800:]}"))
-        log("done.")
+    LAUNCH_DIR = Path(VOL) / "results" / "launches"
+    POLL_S = 30
 
-    @app.function(image=image, volumes={VOL: vol}, timeout=24 * 3600, cpu=2, memory=4096)
-    def sweep_driver(matrix: str, seeds: List[int], gpu: str = "", epochs: int = 0, concurrency: int = 32) -> str:
-        """Run a whole matrix from inside Modal so the laptop client is not needed after launch.
-        Progress goes to /vol/results/logs/driver_<matrix>_<timestamp>.log (committed after every line)."""
+    def _launch_paths():
+        LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+        return sorted(LAUNCH_DIR.glob("*.json"))
+
+    def _save_record(rec: dict, path: Path):
+        path.write_text(B.dumps(rec)); vol.commit()
+
+    def _live_record(matrix: str):
+        """(record, path) of the newest live launch record for this matrix, or (None, None)."""
+        vol.reload()
+        for path in reversed(_launch_paths()):
+            rec = B.loads(path.read_text())
+            if rec["matrix"] == matrix and rec["status"] == B.LIVE:
+                return rec, path
+        return None, None
+
+    def _cancel_all(rec: dict, reason: str, log):
+        """Cancel every live run (terminating its container) and mark the record."""
+        for name in B.live_runs(rec):
+            r = rec["runs"][name]
+            try:
+                modal.FunctionCall.from_id(r["call_id"]).cancel(terminate_containers=True)
+                B.finish_run(rec, name, "cancelled")
+                log(f"cancelled {name} ({r['call_id']}): {reason}")
+            except Exception as e:  # keep going; the watchdog retries
+                log(f"cancel FAILED for {name} ({r['call_id']}): {e!r}")
+        rec["events"].append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason}")
+
+    def _read_run_log(run_name: str) -> str:
+        p = Path(VOL) / "results" / "logs" / f"{run_name}.log"
+        try:
+            return p.read_text()[-20000:]
+        except OSError:
+            return ""
+
+    def _poll(call_id: str):
+        """Result dict, B.PENDING while running (the client raises the built-in TimeoutError for a
+        pending call with timeout=0; verified in modal 1.5.5 _functions.poll_function), or raises."""
+        try:
+            return modal.FunctionCall.from_id(call_id).get(timeout=0)
+        except TimeoutError:
+            return B.PENDING
+
+    def _cancel(call_id: str):
+        modal.FunctionCall.from_id(call_id).cancel(terminate_containers=True)
+
+    def _run_waves_budgeted(waves, configs, gpu, concurrency, log, rec: dict, rec_path: Path):
+        def spawn(c):
+            g = gpu_for(c, gpu or None); tmo = run_timeout_s(c, gpu or None)
+            call = train.with_options(gpu=g, max_containers=concurrency, timeout=tmo).spawn(c)
+            return call.object_id, g, tmo
+
+        def save(r):
+            _save_record(r, rec_path)
+
+        def sleep(sec):
+            time.sleep(sec); vol.reload()
+
+        return B.run_budgeted(waves, rec, spawn=spawn, poll=_poll, cancel=_cancel, read_log=_read_run_log,
+                              save=save, log=log, now=time.time, sleep=sleep, poll_s=POLL_S)
+
+    @app.function(image=image, volumes={VOL: vol}, timeout=24 * 3600, cpu=1, memory=2048)
+    def sweep_driver(matrix: str, seeds: List[int], gpu: str = "", epochs: int = 0, concurrency: int = 32, budget_usd: float = 0.0) -> str:
+        """Run a whole matrix from inside Modal with a runtime budget. Survives the laptop sleeping;
+        after a Modal preemption it re-attaches to the runs in its launch record instead of respawning.
+        Progress: /vol/results/logs/driver_<matrix>_<ts>.log; record: /vol/results/launches/<matrix>_<ts>.json."""
+        if not budget_usd:
+            raise ValueError("sweep_driver requires budget_usd > 0")
         waves = build_matrix(matrix, seeds, epochs or None)
         configs = flatten(waves)
         log_dir = Path(VOL) / "results" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"driver_{matrix}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        rec, rec_path = _live_record(matrix)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if rec is None:
+            rec = B.new_record(matrix, budget_usd, TRAIN_CPU, TRAIN_MEM_GIB, driver_call_id=modal.current_function_call_id() or "",
+                               note=f"seeds={seeds} gpu={gpu or 'default'} est={estimate_cost(configs, gpu or None)}")
+            rec_path = LAUNCH_DIR / f"{matrix}_{stamp}.json"
+            _save_record(rec, rec_path)
+            log_path = log_dir / f"driver_{matrix}_{stamp}.log"
+        else:
+            log_path = log_dir / f"driver_{matrix}_{rec_path.stem.split('_', 1)[1]}.log"
 
         def log(line: str):
             print(line, flush=True)
@@ -559,22 +631,70 @@ if modal is not None:
                 f.write(line + "\n")
             vol.commit()
 
-        log(f"driver start matrix={matrix} seeds={seeds} runs={len(configs)} est={estimate_cost(configs, gpu or None)}")
-        _run_waves(waves, configs, gpu, concurrency, log)
+        log(f"driver start matrix={matrix} seeds={seeds} runs={len(configs)} budget=${budget_usd} record={rec_path.name} "
+            f"est={estimate_cost(configs, gpu or None)}" + (" (re-attached after restart)" if rec["runs"] else ""))
+        try:
+            _run_waves_budgeted(waves, configs, gpu, concurrency, log, rec, rec_path)
+        except Exception as e:
+            _cancel_all(rec, f"driver exception {e!r}", log); rec["status"] = B.HALTED; _save_record(rec, rec_path); raise
         return str(log_path)
 
     @app.local_entrypoint()
-    def status(matrix: str = "", lines: int = 40):
-        """Print the newest cloud-driver log for a matrix (or all) straight from the volume.
-        Runs from any machine with the repo and a Modal token; touches no GPU."""
-        entries = sorted(e.path for e in vol.listdir("results/logs") if e.path.split("/")[-1].startswith("driver_" + matrix))
-        if not entries:
-            print("no driver logs yet"); return
-        for path in entries[-3:]:
-            print(f"--- {path}")
-        latest = entries[-1]
-        text = b"".join(vol.read_file(latest)).decode()
-        print("\n".join(text.splitlines()[-lines:]))
+    def status(matrix: str = "", lines: int = 25):
+        """From any machine with a Modal token: print the newest launch record (accrued cost, per-run
+        elapsed/progress/projection) and the tail of its driver log. Touches no GPU."""
+        vol.reload()
+        recs = []
+        for e in vol.listdir("results/launches"):
+            name = e.path.split("/")[-1]
+            if name.endswith(".json") and (not matrix or name.startswith(matrix + "_")):
+                recs.append(e.path)
+        if not recs:
+            print("no launch records"); return
+        latest = sorted(recs)[-1]
+        rec = B.loads(b"".join(vol.read_file(latest)).decode())
+        print(f"--- {latest}")
+        print("\n".join(B.summary_lines(rec)))
+        stamp = latest.split("/")[-1][len(rec["matrix"]) + 1:-5]
+        try:
+            text = b"".join(vol.read_file(f"results/logs/driver_{rec['matrix']}_{stamp}.log")).decode()
+            print(f"--- driver log tail"); print("\n".join(text.splitlines()[-lines:]))
+        except Exception as e:
+            print(f"(driver log unavailable: {e!r})")
+
+    @app.local_entrypoint()
+    def halt(matrix: str = ""):
+        """From any machine with a Modal token: cancel every live run of the newest live launch record
+        (terminating containers) and cancel its driver. Idempotent."""
+        vol.reload()
+        found = False
+        for e in sorted((x.path for x in vol.listdir("results/launches")), reverse=True):
+            name = e.split("/")[-1]
+            if matrix and not name.startswith(matrix + "_"):
+                continue
+            rec = B.loads(b"".join(vol.read_file(e)).decode())
+            if rec["status"] != B.LIVE:
+                continue
+            found = True
+            for n in B.live_runs(rec):
+                cid = rec["runs"][n]["call_id"]
+                try:
+                    modal.FunctionCall.from_id(cid).cancel(terminate_containers=True); print(f"cancelled {n} {cid}")
+                except Exception as ex:
+                    print(f"cancel failed {n} {cid}: {ex!r}")
+                B.finish_run(rec, n, "halted")
+            if rec.get("driver_call_id"):
+                try:
+                    modal.FunctionCall.from_id(rec["driver_call_id"]).cancel(terminate_containers=True); print(f"cancelled driver {rec['driver_call_id']}")
+                except Exception as ex:
+                    print(f"driver cancel failed: {ex!r}")
+            rec["status"] = B.HALTED; rec["events"].append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} halted from {os.uname().nodename}")
+            with vol.batch_upload(force=True) as batch:
+                batch.put_file(io.BytesIO(B.dumps(rec).encode()), e)
+            print(f"halted {e}; accrued ${B.accrued_usd(rec):.2f}")
+            break
+        if not found:
+            print("no live launch record; nothing to halt (check `modal app list` for stray apps)")
 
     @app.local_entrypoint()
     def sweep(matrix: str = "pilot", seeds: str = "0,1,2,3,4", gpu: str = "", epochs: int = 0,
@@ -588,22 +708,16 @@ if modal is not None:
         configs = flatten(waves)
         est = estimate_cost(configs, gpu or None)
         print(f"matrix={matrix} waves={len(waves)} runs={len(configs)} est={est}")
-        if not dry_run:
-            if not max_cost_usd:
-                raise SystemExit("refusing to launch without --max-cost-usd")
-            if est["worst_case_usd"] > max_cost_usd:
-                raise SystemExit(f"refusing to launch: worst case ${est['worst_case_usd']} (every run hitting its hard timeout) "
-                                 f"exceeds --max-cost-usd {max_cost_usd}; estimate ${est['usd']}")
+        existing, _ = (None, None) if dry_run else _live_record(matrix)
+        why = B.launch_refusal(est, max_cost_usd, driver, existing is not None, dry_run)
+        if why:
+            raise SystemExit(why)
         if dry_run:
             for wi, w in enumerate(waves):
                 print(f"--- wave {wi + 1}: {len(w)} runs")
                 for c in w:
                     print(f"  [{gpu_for(c, gpu or None)}] {c['run_name']}: {' '.join(cfg_to_argv(c, '<data>', '<out>', '<ckpt>'))}")
             return
-        if driver:
-            call = sweep_driver.spawn(matrix, seed_list, gpu, epochs, concurrency)
-            print(f"driver spawned: call id {call.object_id}; progress in the volume under results/logs/driver_{matrix}_*.log "
-                  f"(modal volume ls sprkd-bench results/logs). Run with --detach so the driver outlives this client.")
-            return
-        _run_waves(waves, configs, gpu, concurrency, print)
-        print("Fetch results: modal volume get sprkd-bench results/runs neurips/bench/results/modal_runs")
+        call = sweep_driver.spawn(matrix, seed_list, gpu, epochs, concurrency, max_cost_usd)
+        print(f"driver spawned: call id {call.object_id}; budget ${max_cost_usd}; status: "
+              f"`modal run neurips/bench/modal_app.py::status --matrix {matrix}`; stop: `modal run neurips/bench/modal_app.py::halt --matrix {matrix}`")
