@@ -645,7 +645,11 @@ if modal is not None:
         elapsed/progress/projection) and the tail of its driver log. Touches no GPU."""
         vol.reload()
         recs = []
-        for e in vol.listdir("results/launches"):
+        try:
+            listing = vol.listdir("results/launches")
+        except Exception:
+            listing = []
+        for e in listing:
             name = e.path.split("/")[-1]
             if name.endswith(".json") and (not matrix or name.startswith(matrix + "_")):
                 recs.append(e.path)
@@ -668,7 +672,11 @@ if modal is not None:
         (terminating containers) and cancel its driver. Idempotent."""
         vol.reload()
         found = False
-        for e in sorted((x.path for x in vol.listdir("results/launches")), reverse=True):
+        try:
+            listing = [x.path for x in vol.listdir("results/launches")]
+        except Exception:
+            listing = []
+        for e in sorted(listing, reverse=True):
             name = e.split("/")[-1]
             if matrix and not name.startswith(matrix + "_"):
                 continue
