@@ -66,6 +66,14 @@ VOL = "/vol"
 # billing; region pinning multiplies by 1.5-1.75x). Re-check before budgeting.
 GPU_USD_PER_HOUR = {"H100": 3.95, "A100-80GB": 2.50, "A100": 2.10, "A10G": 1.10, "L4": 0.80, "T4": 0.59}
 GPU_SPEED_VS_A100 = {"H100": 1.6, "A100-80GB": 1.05, "A100": 1.0, "A10G": 0.45, "L4": 0.35, "T4": 0.2}
+# CPU and memory are billed on top of the GPU: train() asks for 8 cores and 32 GiB, roughly
+# 8 x $0.047 + 32 x $0.008 per hour at Modal list prices (approximate).
+CONTAINER_OVERHEAD_USD_PER_HOUR = 0.63
+# Every GPU run gets a hard Modal timeout of TIMEOUT_FACTOR x its estimated hours (clamped), so
+# the worst-case bill of a launch is bounded by TIMEOUT_FACTOR x the estimate, and the launch is
+# refused if that worst case exceeds --max-cost-usd.
+TIMEOUT_FACTOR = 2.0
+MIN_TIMEOUT_S, MAX_TIMEOUT_S = 15 * 60, 24 * 3600
 
 # Rough A100 hours per 240-epoch CIFAR-100 run, scaled from the M2 Pro pilot (resnet8x4 at
 # 42 s/epoch locally, ~7x faster on A100 with an 8-core data pipeline). TinyImageNet is ~2x
@@ -330,30 +338,44 @@ def _gpu_for_unchecked(cfg: dict, gpu_override: str | None) -> str:
     return GPU_IMAGENET if cfg["args"].get("dataset") == "imagenet100" else GPU_DEFAULT
 
 
+def run_hours(c: dict, gpu: str | None = None) -> tuple:
+    """(gpu, estimated hours) for one config."""
+    a = c["args"]; g = _gpu_for_unchecked(c, gpu)
+    speed = GPU_SPEED_VS_A100.get(g, 1.0)
+    if c["runner"] == "cifar_saddle":
+        st = a["stage"]; ep = a.get("student_epochs", 240)
+        # NOTE: the refine/ridge figures are guesses, not measurements; the S1 launch of 2026-09-28
+        # overran them by more than 10x. Measure one step on the target GPU before trusting them.
+        h = {"teachers": 0.8, "refine": 0.9, "ridge": 1.0, "transplant": 3 * 0.45 * ep / 240}[st] * (0.1 if a.get("subset") else 1.0)
+        return g, h / speed
+    if c["runner"] == "malaria":  # ~8 runs x ~2 min each on A100 for the 6k/25k-param CNNs at 100 epochs
+        return g, 0.35 * a.get("epochs", 100) / 100 / speed
+    ds_mult = DATASET_TIME_MULT.get(a.get("dataset", "cifar100"), 1.0)
+    h = A100_HOURS_240EP.get(a["model"], 0.5) * a.get("epochs", 240) / 240 * ds_mult
+    if c["runner"] == "train" and a.get("mode") == "kd":
+        h *= 1.4
+    if c["runner"] == "sprkd":
+        th = A100_HOURS_240EP.get(a["teacher"], 0.5) * a.get("teacher_epochs", 2) * a.get("teachers", 1) / 240 * ds_mult
+        h += th + 0.05 * a.get("teachers", 1)
+    return g, h / speed
+
+
+def run_timeout_s(c: dict, gpu: str | None = None) -> int:
+    _, h = run_hours(c, gpu)
+    return int(min(MAX_TIMEOUT_S, max(MIN_TIMEOUT_S, TIMEOUT_FACTOR * h * 3600)))
+
+
 def estimate_cost(configs: List[dict], gpu: str | None = None) -> Dict[str, float]:
     hours_by_gpu: Dict[str, float] = {}
+    worst = 0.0
     for c in configs:
-        a = c["args"]; g = _gpu_for_unchecked(c, gpu)
-        speed = GPU_SPEED_VS_A100.get(g, 1.0)
-        if c["runner"] == "cifar_saddle":
-            st = a["stage"]; ep = a.get("student_epochs", 240)
-            h = {"teachers": 0.8, "refine": 0.9, "ridge": 1.0, "transplant": 3 * 0.45 * ep / 240}[st] * (0.1 if a.get("subset") else 1.0)
-            hours_by_gpu[g] = hours_by_gpu.get(g, 0.0) + h / speed
-            continue
-        if c["runner"] == "malaria":  # ~8 runs x ~2 min each on A100 for the 6k/25k-param CNNs at 100 epochs
-            hours_by_gpu[g] = hours_by_gpu.get(g, 0.0) + 0.35 * a.get("epochs", 100) / 100 / speed
-            continue
-        ds_mult = DATASET_TIME_MULT.get(a.get("dataset", "cifar100"), 1.0)
-        h = A100_HOURS_240EP.get(a["model"], 0.5) * a.get("epochs", 240) / 240 * ds_mult
-        if c["runner"] == "train" and a.get("mode") == "kd":
-            h *= 1.4
-        if c["runner"] == "sprkd":
-            th = A100_HOURS_240EP.get(a["teacher"], 0.5) * a.get("teacher_epochs", 2) * a.get("teachers", 1) / 240 * ds_mult
-            h += th + 0.05 * a.get("teachers", 1)
-        hours_by_gpu[g] = hours_by_gpu.get(g, 0.0) + h / speed
-    usd = sum(h * GPU_USD_PER_HOUR.get(g, 2.1) for g, h in hours_by_gpu.items())
+        g, h = run_hours(c, gpu)
+        rate = GPU_USD_PER_HOUR.get(g, 2.1) + CONTAINER_OVERHEAD_USD_PER_HOUR
+        hours_by_gpu[g] = hours_by_gpu.get(g, 0.0) + h
+        worst += run_timeout_s(c, gpu) / 3600 * rate
+    usd = sum(h * (GPU_USD_PER_HOUR.get(g, 2.1) + CONTAINER_OVERHEAD_USD_PER_HOUR) for g, h in hours_by_gpu.items())
     return {"runs": len(configs), "gpu_hours": {g: round(h, 1) for g, h in hours_by_gpu.items()},
-            "usd": round(usd, 0)}
+            "usd": round(usd, 0), "worst_case_usd": round(worst, 0)}
 
 
 def cfg_to_argv(cfg: dict, data_root: str, out_root: str, ckpt_dir: str) -> List[str]:
@@ -468,7 +490,7 @@ if modal is not None:
         out_root = f"{VOL}/results/runs"
         log_dir = Path(VOL) / "results" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
         argv = cfg_to_argv(cfg, f"{VOL}/data", out_root, f"{VOL}/checkpoints")
-        env = {**os.environ, "PYTHONPATH": f"{REMOTE_PKG_PARENT}:{REMOTE_BENCH}"}
+        env = {**os.environ, "PYTHONPATH": f"{REMOTE_PKG_PARENT}:{REMOTE_BENCH}", "SPRKD_REQUIRE_CUDA": "1"}
         t0 = time.time()
         with open(log_dir / f"{cfg['run_name']}.log", "w") as log:
             proc = subprocess.run([sys.executable] + argv, cwd=REMOTE_BENCH, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -505,12 +527,12 @@ if modal is not None:
         """Wave loop shared by the local entrypoint and the cloud driver."""
         total_done = 0
         for wi, w in enumerate(waves):
-            groups: Dict[str, List[dict]] = {}
+            groups: Dict[tuple, List[dict]] = {}
             for c in w:
-                groups.setdefault(gpu_for(c, gpu or None), []).append(c)
-            log(f"=== wave {wi + 1}/{len(waves)}: {len(w)} runs across GPUs {sorted(groups)}")
-            for g, cfgs in groups.items():
-                fn = train.with_options(gpu=g, max_containers=concurrency)
+                groups.setdefault((gpu_for(c, gpu or None), run_timeout_s(c, gpu or None)), []).append(c)
+            log(f"=== wave {wi + 1}/{len(waves)}: {len(w)} runs, (gpu, hard timeout s): {sorted(groups)}")
+            for (g, tmo), cfgs in groups.items():
+                fn = train.with_options(gpu=g, max_containers=concurrency, timeout=tmo)
                 for r in fn.map(cfgs, order_outputs=False, return_exceptions=True):
                     total_done += 1
                     if isinstance(r, Exception):
@@ -566,8 +588,12 @@ if modal is not None:
         configs = flatten(waves)
         est = estimate_cost(configs, gpu or None)
         print(f"matrix={matrix} waves={len(waves)} runs={len(configs)} est={est}")
-        if max_cost_usd and est["usd"] > max_cost_usd and not dry_run:
-            raise SystemExit(f"refusing to launch: estimated ${est['usd']} exceeds --max-cost-usd {max_cost_usd}")
+        if not dry_run:
+            if not max_cost_usd:
+                raise SystemExit("refusing to launch without --max-cost-usd")
+            if est["worst_case_usd"] > max_cost_usd:
+                raise SystemExit(f"refusing to launch: worst case ${est['worst_case_usd']} (every run hitting its hard timeout) "
+                                 f"exceeds --max-cost-usd {max_cost_usd}; estimate ${est['usd']}")
         if dry_run:
             for wi, w in enumerate(waves):
                 print(f"--- wave {wi + 1}: {len(w)} runs")
