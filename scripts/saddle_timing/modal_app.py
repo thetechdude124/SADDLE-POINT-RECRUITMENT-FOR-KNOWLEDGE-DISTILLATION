@@ -542,6 +542,19 @@ if modal is not None:
         return str(log_path)
 
     @app.local_entrypoint()
+    def status(matrix: str = "", lines: int = 40):
+        """Print the newest cloud-driver log for a matrix (or all) straight from the volume.
+        Runs from any machine with the repo and a Modal token; touches no GPU."""
+        entries = sorted(e.path for e in vol.listdir("results/logs") if e.path.split("/")[-1].startswith("driver_" + matrix))
+        if not entries:
+            print("no driver logs yet"); return
+        for path in entries[-3:]:
+            print(f"--- {path}")
+        latest = entries[-1]
+        text = b"".join(vol.read_file(latest)).decode()
+        print("\n".join(text.splitlines()[-lines:]))
+
+    @app.local_entrypoint()
     def sweep(matrix: str = "pilot", seeds: str = "0,1,2,3,4", gpu: str = "", epochs: int = 0,
               concurrency: int = 32, dry_run: bool = False, max_cost_usd: float = 0.0, driver: bool = False):
         seed_list = [int(s) for s in seeds.split(",") if s.strip()]
