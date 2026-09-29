@@ -57,6 +57,29 @@ def kd_loss(student_logits, teacher_logits, T: float = 4.0) -> torch.Tensor:
     return F.kl_div(log_p_s, p_t, reduction="batchmean") * (T * T)
 
 
+def atomic_save(obj, path) -> None:
+    """torch.save to a temp file in the same directory, then atomic rename. A kill or preemption
+    mid-write leaves the previous file intact instead of a truncated one (a truncated resume.pt
+    made a restarted run crash on 2026-09-28 in local testing)."""
+    import os
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def safe_load(path, **kw):
+    """torch.load that returns None (with a warning) for a missing or unreadable file."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        return torch.load(path, **kw)
+    except Exception as e:  # truncated or corrupt file
+        print(json.dumps({"warning": f"could not load {path.name}: {type(e).__name__}; starting this phase fresh"}), flush=True)
+        return None
+
+
 def make_sgd(params, lr: float, momentum: float = 0.9, weight_decay: float = 5e-4):
     return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
 
@@ -83,11 +106,15 @@ class RunLogger:
     def log_epoch(self, **kv):
         kv = {"elapsed_s": round(time.time() - self.t0, 1), **kv}
         self.rows.append(kv)
-        write_header = not self.csv_path.exists()
-        with open(self.csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(kv.keys()))
-            if write_header: w.writeheader()
-            w.writerow(kv)
+        # Rows from different phases carry different keys (teacher / inject / student), so rewrite the
+        # CSV with the union of columns each time (rows are few) and keep a JSONL copy as the source of truth.
+        cols = list(dict.fromkeys(k for r in self.rows for k in r))
+        with open(self.csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(self.rows)
+        with open(self.run_dir / "epochs.jsonl", "a") as f:
+            f.write(json.dumps(kv, default=str) + "\n")
         print(json.dumps(kv), flush=True)
         total = self.config.get("epochs") or self.config.get("student_epochs")
         if "epoch" in kv and total:  # heartbeat the Modal driver reads to project wall-clock
