@@ -751,7 +751,8 @@ if modal is not None:
             listing = []
         for e in listing:
             name = e.path.split("/")[-1]
-            if name.endswith(".json") and (not matrix or name.startswith(matrix + "_")):
+            # exact matrix match: "gate" must not pick up "gate_probe_<ts>.json" (timestamps start with a digit)
+            if name.endswith(".json") and (not matrix or (name.startswith(matrix + "_") and name[len(matrix) + 1:][:1].isdigit())):
                 recs.append(e.path)
         if not recs:
             print("no launch records"); return
@@ -777,7 +778,7 @@ if modal is not None:
             listing = []
         for e in sorted(listing, reverse=True):
             name = e.split("/")[-1]
-            if matrix and not name.startswith(matrix + "_"):
+            if matrix and not (name.startswith(matrix + "_") and name[len(matrix) + 1:][:1].isdigit()):
                 continue
             rec = B.loads(b"".join(vol.read_file(e)).decode())
             if rec["status"] != B.LIVE:
