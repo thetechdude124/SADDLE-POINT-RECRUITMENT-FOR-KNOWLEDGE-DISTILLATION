@@ -37,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call
 
-from common import RunLogger, evaluate, get_device, make_multistep, make_sgd, set_seed
+from common import RunLogger, atomic_save, evaluate, get_device, make_multistep, make_sgd, safe_load, set_seed
 from data import get_loaders
 from models import build_model
 
@@ -136,7 +136,7 @@ def train_teacher_with_ckpts(args, seed, train_loader, test_loader, device, out)
             x, y = x.to(device), y.to(device)
             opt.zero_grad(set_to_none=True); loss = F.cross_entropy(t(x), y); loss.backward(); opt.step(); step += 1
             if step in ck_steps:
-                torch.save(t.state_dict(), d / f"ck_{int(round(ck_steps[step] * 100)):03d}.pt")
+                atomic_save(t.state_dict(), d / f"ck_{int(round(ck_steps[step] * 100)):03d}.pt")
                 ev = evaluate(t, test_loader, device)
                 t.train()   # evaluate() switches to eval mode; training must continue with BatchNorm in train mode
                 recs.append({"fraction": ck_steps[step], "step": step, "test_top1": ev["top1"], "test_loss": ev["loss"], "elapsed_s": round(time.time() - t0, 1)})
@@ -150,7 +150,7 @@ def train_teacher_with_ckpts(args, seed, train_loader, test_loader, device, out)
 def stage_teachers(args, device):
     train_loader, test_loader, _ = get_loaders(args.dataset, args.data_root, 64, args.num_workers, 0, args.subset, download=True)
     probe = probe_batch(train_loader, args.probe_size)
-    torch.save(probe, Path(args.out) / "probe.pt")
+    atomic_save(probe, Path(args.out) / "probe.pt")
     for seed in [int(s) for s in args.seeds.split(",")]:
         ck = train_teacher_with_ckpts(args, seed, train_loader, test_loader, device, args.out)
         d = Path(args.out) / f"teacher_s{seed}"
@@ -197,7 +197,7 @@ def stage_refine(args, device):
             ev = evaluate(copy.deepcopy(t).to(device), test_loader, device)
             cls = ("converged_saddle" if c["lambda_min_k"][0] < -0.1 else "converged_minimum_or_flat") if rec["converged"] else ("unconverged_negcurv" if c["lambda_min_k"][0] < 0 else "unconverged")
             done[key] = {"fraction": f, "refine": rec, **c, "test": ev, "dist_rel": float((flat(t) - th0).norm() / th0.norm()), "class": cls, "wall_s": round(time.time() - t0, 1)}
-            torch.save(t.state_dict(), d / f"{tag}_{key}.pt")
+            atomic_save(t.state_dict(), d / f"{tag}_{key}.pt")
             json.dump(done, open(out_json, "w"), indent=2)
             print(json.dumps({"seed": seed, "fraction": f, "gn": (round(rec["grad_norm_before"], 4), round(rec["grad_norm_after"], 5)), "loss": (round(rec["loss_before"], 4), round(rec["loss_after"], 4)), "test_top1": round(ev["top1"], 2), "lmin": round(c["lambda_min_k"][0], 4), "class": cls, "s": done[key]["wall_s"]}), flush=True)
 
@@ -295,11 +295,11 @@ def stage_ridge(args, device):
             if it % 50 == 0 or it == args.climb_iters - 1: hist.append({"phase": "climb", "iter": it, "loss": l, "grad_norm": float(g.norm())}); print(json.dumps({key: hist[-1]}), flush=True)
         path_test = [fl.loss_loader(v, test_loader, device) for v in nodes]
         m_ci = build_model(args.teacher, 100).to(device); load_flat(m_ci, nodes[ci])
-        torch.save(m_ci.state_dict(), Path(args.out) / f"{key}_climb.pt")
+        atomic_save(m_ci.state_dict(), Path(args.out) / f"{key}_climb.pt")
         m_ref = copy.deepcopy(m_ci); t1 = time.time()
         rf = refine_to_stationary(m_ref, nn.CrossEntropyLoss(), probe, max_steps=args.refine_steps, grad_tol=args.refine_grad_tol, lr=args.refine_lr, method=args.refine_method, solver_iters=50)
         c = curvature(m_ref, probe); ev = evaluate(copy.deepcopy(m_ref).to(device), test_loader, device)
-        torch.save(m_ref.state_dict(), Path(args.out) / f"{key}_refined.pt")
+        atomic_save(m_ref.state_dict(), Path(args.out) / f"{key}_refined.pt")
         done[key] = {"pair": [sa, sb], "endpoint_test": [evaluate(tA, test_loader, device), evaluate(tB, test_loader, device)], "endpoint_l2": float((a - b).norm()),
                      "linear_path_test_loss": lin, "string_path_subset_loss": losses, "string_path_test_loss": path_test, "climbing_index": ci,
                      "barrier_test": max(path_test) - 0.5 * (path_test[0] + path_test[-1]), "climb_test": evaluate(m_ci, test_loader, device),

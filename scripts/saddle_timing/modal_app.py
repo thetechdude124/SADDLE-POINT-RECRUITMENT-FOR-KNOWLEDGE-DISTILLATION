@@ -181,22 +181,37 @@ def build_matrix(name: str, seeds: List[int], epochs: int | None = None) -> List
         pts += [f"final:{seeds[0]}", f"hisd:{seeds[0]}:1.0", f"ck:{seeds[0]}:0.5", f"ref:{seeds[0]}:0.5", f"ck:{seeds[0]}:0.2", f"ref:{seeds[0]}:0.2"]
         return [[_cfg("cifar_saddle", "s3_" + pt.replace(":", "_"), stage="transplant", point=pt, student_seeds="0,1,2", student_epochs=E, milestones=[150, 180, 210]) for pt in pts]]
 
-    if name == "gate":  # lean first paid launch, no Hessian work (07_saddle_timing_analysis.md):
-        # E0 smoke (2 arms, 3 epochs, 1 seed) + per seed: 2-epoch weak teacher with checkpoints at 20/50/100%,
-        # scratch, last-checkpoint init at each fraction, KD-weak with the fixed loss. 240-epoch CRD schedule.
+    if name == "gate_probe":  # correctness + epoch timing for every gate run type, on A100 and T4 (2 epochs each)
         t, s = PAIRS[0]
-        w0 = [_cfg("train", f"pilot_{s}_scratch_s{seeds[0]}", mode="scratch", model=s, epochs=3, milestones=[2], seed=seeds[0]),
-              _cfg("sprkd", f"pilot_{s}_lastinit_from_{t}_s{seeds[0]}", model=s, teacher=t, teachers=1, teacher_epochs=1, saddle_steps=100000, asr_mode="last", init_only=True, epochs=3, milestones=[2], seed=seeds[0])]
+        tname = f"gate_teacher_{t}_2ep_s0"   # the real gate teacher for seed 0; the full gate resumes and skips it
+        w1 = [_cfg("train", tname, mode="scratch", model=t, epochs=2, milestones=[1], seed=0, save_ckpt=True,
+                   ckpt_fractions=[0.2, 0.5, 1.0], resume=True, probe=True, gpu="A100")]
+        w2 = []
+        for g in ("A100", "T4"):
+            gl = g.lower()
+            w2.append(_cfg("train", f"gprobe_{gl}_{s}_scratch", mode="scratch", model=s, epochs=2, milestones=[1], seed=0, probe=True, gpu=g))
+            w2.append(_cfg("sprkd", f"gprobe_{gl}_{s}_lastinit_f050", model=s, teacher=t, teachers=1, teacher_epochs=0,
+                           teacher_ckpt=_run_frac_ckpt(tname, 0.5), asr_mode="last", init_only=True, epochs=2, milestones=[1], seed=0, probe=True, gpu=g))
+            w2.append(_cfg("train", f"gprobe_{gl}_{s}_kdweak", mode="kd", model=s, teacher=t, teacher_ckpt=_run_frac_ckpt(tname, 1.0),
+                           epochs=2, milestones=[1], seed=0, probe=True, gpu=g))
+        return [w1, w2]
+    if name == "gate":  # warm start vs scratch vs KD on resnet32x4 -> resnet8x4, 240-epoch CRD schedule, no Hessian work
+        # wave 1: a 2-epoch weak teacher per seed, saving checkpoints at 20/50/100% of its training.
+        # wave 2: scratch; init from each teacher checkpoint (key-matched crop, then plain SGD); KD from the teacher's
+        # final (100%) checkpoint, not its best-by-test epoch. Every run resumes after a preemption.
+        t, s = PAIRS[0]
         w1, w2 = [], []
         for seed in seeds:
             tname = f"gate_teacher_{t}_2ep_s{seed}"
-            w1.append(_cfg("train", tname, mode="scratch", model=t, epochs=2, milestones=[1], seed=seed, save_ckpt=True, ckpt_fractions=[0.2, 0.5, 1.0]))
-            w1.append(_cfg("train", f"gate_{s}_scratch_s{seed}", mode="scratch", model=s, epochs=E, seed=seed))
+            w1.append(_cfg("train", tname, mode="scratch", model=t, epochs=2, milestones=[1], seed=seed, save_ckpt=True,
+                           ckpt_fractions=[0.2, 0.5, 1.0], resume=True))
+            w2.append(_cfg("train", f"gate_{s}_scratch_s{seed}", mode="scratch", model=s, epochs=E, seed=seed, resume=True))
             for fr in (0.2, 0.5, 1.0):
                 w2.append(_cfg("sprkd", f"gate_{s}_lastinit_f{int(fr * 100):03d}_from_{t}_s{seed}", model=s, teacher=t, teachers=1, teacher_epochs=0,
-                               teacher_ckpt=_run_frac_ckpt(tname, fr), asr_mode="last", init_only=True, epochs=E, seed=seed))
-            w2.append(_cfg("train", f"gate_{s}_kdweak_T2_from_{t}_s{seed}", mode="kd", model=s, teacher=t, teacher_ckpt=_run_ckpt(tname), epochs=E, seed=seed))
-        return [w0 + w1, w2]
+                               teacher_ckpt=_run_frac_ckpt(tname, fr), asr_mode="last", init_only=True, epochs=E, seed=seed, resume=True))
+            w2.append(_cfg("train", f"gate_{s}_kdweak_from_{t}_s{seed}", mode="kd", model=s, teacher=t,
+                           teacher_ckpt=_run_frac_ckpt(tname, 1.0), epochs=E, seed=seed, resume=True))
+        return [w1, w2]
 
     if name == "e1":  # malaria redo (one container per seed runs every arm; tiny models)
         return [[_cfg("malaria", f"malaria_e1_s{seed}", seed=seed, arms="all", epochs=epochs or 100) for seed in seeds]]
@@ -338,7 +353,7 @@ GPU_SMOKE = os.environ.get("SPRKD_GPU_SMOKE", "T4")
 
 
 def gpu_for(cfg: dict, gpu_override: str | None) -> str:
-    g = gpu_override or ("T4" if cfg["runner"] == "control" else GPU_SADDLE if cfg["runner"] in ("cifar_saddle", "probe") else
+    g = gpu_override or cfg["args"].get("gpu") or ("T4" if cfg["runner"] == "control" else GPU_SADDLE if cfg["runner"] in ("cifar_saddle", "probe") else
                          GPU_SMOKE if cfg["run_name"].startswith("pilot_") else
                          GPU_IMAGENET if cfg["args"].get("dataset") == "imagenet100" else GPU_DEFAULT)
     if g not in ALLOWED_GPUS:
@@ -349,6 +364,8 @@ def gpu_for(cfg: dict, gpu_override: str | None) -> str:
 def _gpu_for_unchecked(cfg: dict, gpu_override: str | None) -> str:
     if gpu_override:
         return gpu_override
+    if cfg["args"].get("gpu"):
+        return cfg["args"]["gpu"]
     if cfg["runner"] == "control":
         return "T4"
     if cfg["runner"] in ("cifar_saddle", "probe"):
@@ -364,11 +381,31 @@ def _gpu_for_unchecked(cfg: dict, gpu_override: str | None) -> str:
 MEASURED_A100 = {"hvp_s": 0.2425, "adam_step_s": 0.3001, "hisd_step_s": 3.0594, "curvature_s": 97.96, "eval_s": 15.0}
 CONTAINER_START_H = 3 / 60
 
+# Seconds per training epoch (CIFAR-100, batch 64), measured on Modal 2026-09-29 by launch
+# gate_probe_20260929_010805 (second epoch of each 2-epoch probe run; gate_cost_from_probe.py).
+# Keys: (runner kind, model, GPU). "teacher_total_s" is the whole 2-epoch teacher run.
+MEASURED_EPOCH_S = {
+    ("scratch", "resnet8x4", "A100"): 6.5, ("init", "resnet8x4", "A100"): 6.8, ("kd", "resnet8x4", "A100"): 11.5,
+    ("scratch", "resnet8x4", "T4"): 19.0, ("init", "resnet8x4", "T4"): 19.4, ("kd", "resnet8x4", "T4"): 38.5,
+    ("scratch", "resnet32x4", "A100"): 20.4,   # gate teacher: 40.7 s for 2 epochs incl. evaluation
+}
 
-def is_measured(c: dict) -> bool:
+
+def _epoch_key(c: dict, gpu: str):
+    a = c["args"]
+    if c["runner"] == "train":
+        return ("kd" if a.get("mode") == "kd" else "scratch", a["model"], gpu)
+    if c["runner"] == "sprkd" and a.get("init_only") and a.get("teacher_epochs", 2) == 0:
+        return ("init", a["model"], gpu)
+    return None
+
+
+def is_measured(c: dict, gpu: str | None = None) -> bool:
     """Only stage types whose per-step time was measured on the target GPU may launch
     (see neurips/10_s1_incident.md). Control and probe runs are the measuring tools."""
-    if c["runner"] in ("control", "probe"):
+    if c["runner"] in ("control", "probe") or c["args"].get("probe"):
+        return True
+    if _epoch_key(c, _gpu_for_unchecked(c, gpu)) in MEASURED_EPOCH_S:
         return True
     if c["runner"] == "cifar_saddle":
         a = c["args"]
@@ -395,7 +432,10 @@ def run_hours(c: dict, gpu: str | None = None) -> tuple:
         return g, 0.35 * a.get("epochs", 100) / 100 / speed
     if c["runner"] == "control":
         return g, a.get("est_h", 0.1)
-    if c["runner"] == "probe":
+    k = _epoch_key(c, g)
+    if k in MEASURED_EPOCH_S and not a.get("probe"):
+        return g, CONTAINER_START_H + a.get("epochs", 240) * MEASURED_EPOCH_S[k] / 3600
+    if c["runner"] == "probe" or a.get("probe"):
         return g, 0.125
     ds_mult = DATASET_TIME_MULT.get(a.get("dataset", "cifar100"), 1.0)
     h = A100_HOURS_240EP.get(a["model"], 0.5) * a.get("epochs", 240) / 240 * ds_mult
@@ -423,7 +463,7 @@ def estimate_cost(configs: List[dict], gpu: str | None = None) -> Dict[str, floa
     usd = sum(h * (GPU_USD_PER_HOUR.get(g, 2.1) + CONTAINER_OVERHEAD_USD_PER_HOUR) for g, h in hours_by_gpu.items())
     return {"runs": len(configs), "gpu_hours": {g: round(h, 1) for g, h in hours_by_gpu.items()},
             "usd": round(usd, 2), "worst_case_usd": round(worst, 2),
-            "unmeasured": sorted({c["run_name"] for c in configs if not is_measured(c)})}
+            "unmeasured": sorted({c["run_name"] for c in configs if not is_measured(c, gpu)})}
 
 
 def cfg_to_argv(cfg: dict, data_root: str, out_root: str, ckpt_dir: str) -> List[str]:
@@ -439,7 +479,7 @@ def cfg_to_argv(cfg: dict, data_root: str, out_root: str, ckpt_dir: str) -> List
         if "num_workers" not in cfg["args"]:
             argv += ["--num-workers", "8"]
     for k, v in cfg["args"].items():
-        if k == "est_h":
+        if k in ("est_h", "probe", "gpu"):
             continue
         flag = "--" + k.replace("_", "-")
         if k == "teacher_ckpt":
